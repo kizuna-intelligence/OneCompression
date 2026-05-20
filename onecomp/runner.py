@@ -1721,10 +1721,19 @@ class Runner:
         modules_in_block = list(quantized_names)
         quant_config["modules_in_block_to_quantize"] = modules_in_block
         quant_config["quantized_layer_names"] = modules_in_block
-        # Adapter-driven models (e.g. DiT) may not expose an HF-style
-        # ``model.config``.  The vLLM/HF quant_config is irrelevant for
-        # them — the adapter writes its own checkpoint metadata — so skip
-        # the rest of the metadata construction entirely.
+        # Adapter-driven models (e.g. DiT) write their own checkpoint
+        # metadata via ``adapter.save_quantized_model`` / ``build_save_metadata``,
+        # so the vLLM/HF quant_config is irrelevant for them.  Skip the rest of
+        # the metadata construction for any non-HF adapter — both those with no
+        # ``model.config`` at all (Irodori's plain nn.Module) and those that do
+        # expose one (diffusers models like FLUX.2) whose schema (``num_layers``
+        # etc.) does not match the HF ``num_hidden_layers`` contract.
+        from .adapters.hf_llm import HFLLMAdapter as _HFLLMAdapter
+
+        _adapter = getattr(self.model_config, "adapter", None)
+        if _adapter is not None and not isinstance(_adapter, _HFLLMAdapter):
+            return model, tokenizer
+
         model_config_obj = getattr(model, "config", None)
         if model_config_obj is None:
             return model, tokenizer

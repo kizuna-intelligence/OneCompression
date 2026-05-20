@@ -23,6 +23,10 @@ def __getattr__(name):  # PEP 562 lazy import
         from .diffusion import IrodoriDiTAdapter
 
         return IrodoriDiTAdapter
+    if name == "Flux2DiTAdapter":
+        from .diffusion import Flux2DiTAdapter
+
+        return Flux2DiTAdapter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -31,4 +35,5 @@ __all__ = [
     "HFLLMAdapter",
     "DiffusionTransformerAdapter",
     "IrodoriDiTAdapter",
+    "Flux2DiTAdapter",
 ]
