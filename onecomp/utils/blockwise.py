@@ -10,27 +10,35 @@ from logging import getLogger
 
 import torch
 from torch import nn
-from transformers.modeling_layers import GradientCheckpointingLayer
+try:
+    from transformers.modeling_layers import GradientCheckpointingLayer
+except ImportError:
+    # transformers < 4.52 has no modeling_layers; the legacy HF block-discovery
+    # fallback below is unused when an adapter supplies get_blocks.
+    class GradientCheckpointingLayer:  # type: ignore[no-redef]
+        pass
 
 logger = getLogger(__name__)
 
 
 def _get_blocks(
     model: nn.Module,
+    adapter=None,
 ) -> nn.ModuleList:
-    """Get the language-model transformer blocks in the model.
+    """Get the quantization blocks in the model.
 
-    For VLMs (e.g., Qwen3-VL, Gemma3) that contain both a vision encoder
-    and a language model, this returns the language-model decoder blocks
-    only.  For standard CausalLMs the behaviour is unchanged.
+    When ``adapter`` is provided, delegates to :meth:`ModelAdapter.get_blocks`
+    so that custom architectures (e.g. diffusion transformers) can return
+    their own block list.
 
-    The detection works by looking for a ``language_model`` sub-module in
-    the model tree.  If found, the search for ``GradientCheckpointingLayer``
-    blocks is restricted to that sub-module so that vision-encoder blocks
-    are never returned.
+    For HuggingFace VLMs (Qwen3-VL, Gemma3) the legacy fallback restricts
+    discovery to the ``language_model`` / ``text_model`` submodule and
+    looks for an ``nn.ModuleList`` of ``GradientCheckpointingLayer``.
 
     Args:
         model (nn.Module): The model to analyze.
+        adapter (ModelAdapter, optional): Adapter that knows the model's
+            block layout.  Falls back to HF heuristics when ``None``.
 
     Raises:
         RuntimeError: If transformer blocks are not found.
@@ -38,9 +46,10 @@ def _get_blocks(
     Returns:
         nn.ModuleList: The list of transformer blocks.
     """
-    # Sub-module name suffixes that indicate a language-model backbone inside a VLM.
-    # "language_model": Qwen3-VL, Gemma3, LLaVA
-    # "text_model": InternVL and similar architectures
+    if adapter is not None:
+        return adapter.get_blocks(model)
+
+    # Legacy HF path.
     _VLM_TEXT_SUFFIXES = ("language_model", "text_model")
 
     search_root = model
@@ -70,7 +79,16 @@ class Catcher(nn.Module):
     Attribute access is proxied to the wrapped module so that model code
     that reads layer attributes (e.g. ``attention_type``) before calling
     ``forward()`` does not raise ``AttributeError``.
+
+    Some custom models (e.g. DiT) invoke their blocks with all-keyword
+    arguments (``block(x=x, cond_embed=...)``).  In that case the input
+    tensor is recovered from kwargs and stripped before storage so the
+    downstream positional call ``block(inp, **kwargs)`` does not pass
+    ``x`` twice.
     """
+
+    # Names that conventionally hold the block's primary input tensor.
+    _INPUT_KWARG_NAMES = ("x", "hidden_states", "input")
 
     def __init__(self, module: nn.Module):
         super().__init__()
@@ -84,9 +102,21 @@ class Catcher(nn.Module):
         except AttributeError:
             return getattr(self.module, name)
 
-    # *args should be gotten from the model such as per_layer_input for gemma4,
-    # but it is calculated and added in _compute_per_layer_inputs() and prepare_block_kwargs(), respectively.
-    def forward(self, inp: torch.Tensor, *args, **kwargs: dict):
+    def forward(self, *args, **kwargs):
+        if args:
+            inp = args[0]
+        else:
+            inp = None
+            for name in self._INPUT_KWARG_NAMES:
+                if name in kwargs:
+                    inp = kwargs.pop(name)
+                    break
+            if inp is None:
+                raise RuntimeError(
+                    "Catcher could not locate the block's input tensor — "
+                    "expected first positional arg or one of "
+                    f"{self._INPUT_KWARG_NAMES}."
+                )
         self.inp = inp.clone()
         self.kwargs.update(kwargs)
         raise StopForward()
@@ -153,6 +183,7 @@ def get_blocks_and_inputs(
     model: nn.Module,
     model_inputs: dict[str, torch.Tensor],
     batch_size: int,
+    adapter=None,
 ) -> tuple[nn.ModuleList, torch.Tensor, dict[str, torch.Tensor]]:
     """Get the transformer blocks and their input activations.
 
@@ -172,87 +203,121 @@ def get_blocks_and_inputs(
         model (nn.Module): The model to analyze.
         model_inputs (dict[str, torch.Tensor]): The input tensors for the model.
         batch_size (int): The batch size for computing input activations.
+        adapter (ModelAdapter, optional): Drives slicing and forward calls
+            for non-HF architectures.  When ``None`` the legacy HF path
+            is used (input_ids-based slicing, positional first-arg call).
 
     Returns:
         tuple[nn.ModuleList, torch.Tensor, dict[str, torch.Tensor]]:
         The list of transformer blocks, the input activations, and the keyword arguments.
     """
 
-    blocks = _get_blocks(model)
+    blocks = _get_blocks(model, adapter=adapter)
 
     # Detect models with heterogeneous layer types (e.g. Gemma4 with
-    # full_attention / sliding_attention)
-    blocks_parent = _find_blocks_parent(model, blocks)
-    layer_types = getattr(getattr(blocks_parent, "config", None), "layer_types", None)
-    unique_layer_types = set(layer_types) if layer_types else set()
-    has_mixed_types = len(unique_layer_types) > 1
-
+    # full_attention / sliding_attention).  Adapter-driven flows skip
+    # this entirely (custom architectures handle layer-type dispatch
+    # inside their own forward pass).
+    blocks_parent = None
+    has_mixed_types = False
+    unique_layer_types = set()
     rotary_hook_handle = None
     pos_emb_map: dict[str, tuple[torch.Tensor, ...]] = {}
-    if has_mixed_types:
-        rotary_emb = getattr(blocks_parent, "rotary_emb", None)
-        if rotary_emb is not None:
-            def _capture_rotary(_mod, args, output):
-                lt = args[2] if len(args) > 2 else None
-                if lt is not None:
-                    pos_emb_map[lt] = tuple(t.clone() for t in output)
-            rotary_hook_handle = rotary_emb.register_forward_hook(_capture_rotary)
+    if adapter is None:
+        blocks_parent = _find_blocks_parent(model, blocks)
+        layer_types = getattr(
+            getattr(blocks_parent, "config", None), "layer_types", None
+        )
+        unique_layer_types = set(layer_types) if layer_types else set()
+        has_mixed_types = len(unique_layer_types) > 1
+
+        if has_mixed_types:
+            rotary_emb = getattr(blocks_parent, "rotary_emb", None)
+            if rotary_emb is not None:
+                def _capture_rotary(_mod, args, output):
+                    lt = args[2] if len(args) > 2 else None
+                    if lt is not None:
+                        pos_emb_map[lt] = tuple(t.clone() for t in output)
+                rotary_hook_handle = rotary_emb.register_forward_hook(
+                    _capture_rotary
+                )
 
     # replace the first transformer block with a input catcher.
     blocks[0] = Catcher(blocks[0])
 
-    inp_ids = model_inputs["input_ids"]
-    model_kwargs = {k: v for k, v in model_inputs.items() if k != "input_ids"}
-    model_kwargs["use_cache"] = False
+    if adapter is None:
+        inp_ids = model_inputs["input_ids"]
+        model_kwargs = {k: v for k, v in model_inputs.items() if k != "input_ids"}
+        model_kwargs["use_cache"] = False
 
-    # Capture kwargs with batch=1 so they stay batch-independent.
-    # expand_kwargs_batch() will later expand them to match each forward call.
-    single_kwargs = {
-        k: v[:1] if isinstance(v, torch.Tensor) and v.dim() >= 1 else v
-        for k, v in model_kwargs.items()
-    }
-    logger.info("Capturing batch-independent kwargs with single sample.")
-    try:
-        _ = model(inp_ids[:1], **single_kwargs)
-    except StopForward:
-        pass
-
-    if rotary_hook_handle is not None:
-        rotary_hook_handle.remove()
-
-    kwargs = dict(blocks[0].kwargs)  # shallow-copy before next loop overwrites
-    blocks[0].inp = None  # release single-sample activation (no longer needed)
-
-    # Now capture block inputs for all calibration samples.
-    block_inps = []
-    for inp in inp_ids.split(batch_size):
+        single_kwargs = {
+            k: v[:1] if isinstance(v, torch.Tensor) and v.dim() >= 1 else v
+            for k, v in model_kwargs.items()
+        }
+        logger.info("Capturing batch-independent kwargs with single sample.")
         try:
-            _ = model(inp, **model_kwargs)
+            _ = model(inp_ids[:1], **single_kwargs)
         except StopForward:
-            block_inps.append(blocks[0].inp.cpu())
+            pass
+
+        if rotary_hook_handle is not None:
+            rotary_hook_handle.remove()
+
+        kwargs = dict(blocks[0].kwargs)
+        blocks[0].inp = None
+
+        block_inps = []
+        for inp in inp_ids.split(batch_size):
+            try:
+                _ = model(inp, **model_kwargs)
+            except StopForward:
+                block_inps.append(blocks[0].inp.cpu())
+    else:
+        n_total = adapter.num_calibration_samples(model_inputs)
+        single = adapter.slice_calibration_inputs(model_inputs, 0, 1)
+        logger.info(
+            "Capturing batch-independent kwargs with single sample "
+            "(adapter=%s).",
+            type(adapter).__name__,
+        )
+        try:
+            _ = adapter.run_calibration_forward(model, single)
+        except StopForward:
+            pass
+
+        kwargs = dict(blocks[0].kwargs)
+        blocks[0].inp = None
+
+        block_inps = []
+        for start in range(0, n_total, batch_size):
+            end = min(start + batch_size, n_total)
+            chunk = adapter.slice_calibration_inputs(model_inputs, start, end)
+            try:
+                _ = adapter.run_calibration_forward(model, chunk)
+            except StopForward:
+                block_inps.append(blocks[0].inp.cpu())
 
     inps = torch.cat(block_inps)
 
     # restore the original transformer block
     blocks[0] = blocks[0].module
 
-    # Pre-compute per-layer inputs for some models (e.g. Gemma4).
-    pli = _compute_per_layer_inputs(model, blocks, inp_ids, batch_size)
-    if pli is not None:
-        kwargs[_PER_LAYER_INPUTS_KEY] = pli
+    # Gemma4 / heterogeneous-layer-type post-processing only applies to
+    # the legacy HF path; adapter-driven flows handle their own dispatch.
+    if adapter is None:
+        pli = _compute_per_layer_inputs(model, blocks, inp_ids, batch_size)
+        if pli is not None:
+            kwargs[_PER_LAYER_INPUTS_KEY] = pli
 
-    # Store per-type position embeddings and attention masks when the model
-    # uses heterogeneous layer types (full_attention and sliding_attention).
-    if len(pos_emb_map) > 1:
-        kwargs[_POS_EMB_MAP_KEY] = pos_emb_map
+        if len(pos_emb_map) > 1:
+            kwargs[_POS_EMB_MAP_KEY] = pos_emb_map
 
-    # Store per-type attention masks when the model uses heterogeneous layer types.
-    if has_mixed_types and blocks_parent is not None:
-        attn_mask_map = _compute_per_type_attention_masks(
-            blocks_parent, kwargs, unique_layer_types,
-        )
-        if attn_mask_map is not None:
-            kwargs[_ATTN_MASK_MAP_KEY] = attn_mask_map
+        if has_mixed_types and blocks_parent is not None:
+            attn_mask_map = _compute_per_type_attention_masks(
+                blocks_parent, kwargs, unique_layer_types,
+            )
+            if attn_mask_map is not None:
+                kwargs[_ATTN_MASK_MAP_KEY] = attn_mask_map
 
     return (blocks, inps, kwargs)
 

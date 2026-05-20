@@ -18,16 +18,20 @@ from onecomp.utils.blockwise import (
 )
 
 
-def _find_head_modules(model, blocks):
-    """Find the norm layer and lm_head that follow the transformer blocks.
+def _find_head_modules(model, blocks, adapter=None):
+    """Find the (norm, head) modules that follow the transformer blocks.
 
-    Walks the module tree to locate the parent of blocks, then looks
-    for known attribute names used by common HuggingFace architectures.
+    When ``adapter`` is supplied, delegates to
+    :meth:`ModelAdapter.get_head_modules` so non-HF architectures (DiT,
+    etc.) can return their own ``(out_norm, out_proj)``.  Otherwise
+    falls back to attribute-name heuristics for HF causal LMs.
 
     Returns:
-        tuple[nn.Module, nn.Module]: (norm, lm_head)
-
+        tuple[nn.Module, nn.Module]: (norm, head)
     """
+    if adapter is not None:
+        return adapter.get_head_modules(model)
+
     parent = None
     for name, module in model.named_modules():
         if module is blocks:
@@ -81,15 +85,17 @@ def collect_activation_stats_blockwise(
     batch_size=16,
     device=None,
     logger=None,
+    adapter=None,
 ):
     """Collect full Gram and curvature matrices via block-wise processing.
+
+    When ``adapter`` is supplied, calibration data is produced via the
+    adapter (so non-HF architectures can plug in here), and the
+    curvature loss for ``b_diag`` uses ``adapter.compute_curvature_loss``.
 
     Returns:
         tuple[dict, dict]: (a_diag, b_diag)
     """
-    from transformers import AutoTokenizer
-    from onecomp.calibration import prepare_calibration_dataset
-
     if device is None:
         device = torch.device("cuda")
 
@@ -100,22 +106,39 @@ def collect_activation_stats_blockwise(
         model.to("cpu")
         torch.cuda.empty_cache()
 
-    model_id = getattr(model.config, "_name_or_path", None)
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    calib_data = prepare_calibration_dataset(
-        tokenizer=tokenizer,
-        device=torch.device("cpu"),
-        calibration_config=calibration_config,
-        model=model,
+    if adapter is not None:
+        calib_data = adapter.prepare_calibration_inputs(
+            model=model,
+            calibration_config=calibration_config,
+            device=torch.device("cpu"),
+            logger=logger,
+        )
+        num_samples = calibration_config.num_calibration_samples
+        actual_samples = min(num_samples, adapter.num_calibration_samples(calib_data))
+        model_inputs = adapter.slice_calibration_inputs(
+            calib_data, 0, actual_samples
+        )
+        seqlen_for_log = getattr(calibration_config, "max_length", "?")
+    else:
+        from transformers import AutoTokenizer
+        from onecomp.calibration import prepare_calibration_dataset
+
+        model_id = getattr(model.config, "_name_or_path", None)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        calib_data = prepare_calibration_dataset(
+            tokenizer=tokenizer,
+            device=torch.device("cpu"),
+            calibration_config=calibration_config,
+            model=model,
+        )
+        num_samples = calibration_config.num_calibration_samples
+        actual_samples = min(num_samples, calib_data["input_ids"].shape[0])
+        model_inputs = {k: v[:actual_samples] for k, v in calib_data.items()}
+        seqlen_for_log = calibration_config.max_length
+
+    blocks, inps, kwargs = get_blocks_and_inputs(
+        model, model_inputs, batch_size, adapter=adapter
     )
-
-    num_samples = calibration_config.num_calibration_samples
-    actual_samples = min(num_samples, calib_data["input_ids"].shape[0])
-    model_inputs = {
-        k: v[:actual_samples] for k, v in calib_data.items()
-    }
-
-    blocks, inps, kwargs = get_blocks_and_inputs(model, model_inputs, batch_size)
     kwargs = move_kwargs_to_device(kwargs, device)
     block_to_candidates = _map_candidates_to_blocks(blocks, candidates)
 
@@ -133,10 +156,10 @@ def collect_activation_stats_blockwise(
     if logger:
         tag = "Gram + Curvature" if use_curvature_b else "Gram only"
         logger.info(
-            "Block-wise activation stats (%s): %d samples, seqlen=%d, " "%d blocks, %d layers",
+            "Block-wise activation stats (%s): %d samples, seqlen=%s, " "%d blocks, %d layers",
             tag,
             actual_samples,
-            calibration_config.max_length,
+            seqlen_for_log,
             len(blocks),
             len(candidates),
         )
@@ -162,7 +185,7 @@ def collect_activation_stats_blockwise(
 
     # Collect b_diag
     if use_curvature_b:
-        norm, lm_head = _find_head_modules(model, blocks)
+        norm, lm_head = _find_head_modules(model, blocks, adapter=adapter)
         if norm is None or lm_head is None:
             raise RuntimeError(
                 "Cannot compute curvature: "
@@ -171,14 +194,14 @@ def collect_activation_stats_blockwise(
                 "The model may use non-standard module names. "
                 "Set use_curvature_b=False to skip curvature estimation."
             )
-        input_ids = model_inputs["input_ids"]
 
         grad = _compute_loss_grad(
             saved_inps[-1],
             norm,
             lm_head,
-            input_ids,
+            model_inputs,
             device,
+            adapter=adapter,
         )
 
         for block_idx in range(len(blocks) - 1, -1, -1):
@@ -251,26 +274,48 @@ def _make_bwd_hook(key, B_accum):
     return hook
 
 
-def _compute_loss_grad(final_hidden, norm, lm_head, input_ids, device):
+def _compute_loss_grad(final_hidden, norm, lm_head, model_inputs, device, adapter=None):
+    """Backprop ``∂loss/∂final_hidden`` for one calibration sample at a time.
+
+    For HF causal LMs ``model_inputs["input_ids"]`` drives a cross-entropy
+    loss over shifted labels.  For other architectures the adapter's
+    :meth:`compute_curvature_loss` is invoked with the per-sample input
+    slice (e.g. DiT MSE on velocity).
+    """
     all_grads = []
 
     norm.to(device)
     lm_head.to(device)
 
-    for i in range(final_hidden.shape[0]):
+    n_samples = final_hidden.shape[0]
+    for i in range(n_samples):
         out_i = final_hidden[i : i + 1].to(device)
         out_i = out_i.detach().requires_grad_(True)
-        ids_i = input_ids[i : i + 1].to(device)
+
+        if adapter is not None:
+            sample_inputs = adapter.slice_calibration_inputs(model_inputs, i, i + 1)
+        else:
+            sample_inputs = {"input_ids": model_inputs["input_ids"][i : i + 1].to(device)}
 
         with torch.enable_grad():
-            normed = norm(out_i)
-            logits = lm_head(normed)
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = ids_i[:, 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            )
+            if adapter is not None:
+                loss = adapter.compute_curvature_loss(
+                    final_hidden=out_i,
+                    norm=norm,
+                    head=lm_head,
+                    sample_inputs=sample_inputs,
+                    device=device,
+                )
+            else:
+                normed = norm(out_i)
+                logits = lm_head(normed)
+                ids_i = sample_inputs["input_ids"]
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = ids_i[:, 1:].contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                )
             loss.backward()
 
         all_grads.append(out_i.grad.cpu())

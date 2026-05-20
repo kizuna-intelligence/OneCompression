@@ -66,6 +66,14 @@ hydra = [
     "hydra-core",
 ]
 vllm = ["vllm>=0.10"]
+dit-tts = [
+    # Optional support for the Faster-Irodori-TTS2 DiT via DiTAdapter.
+    # The ``irodori-tts`` package is not on PyPI; install it from your
+    # local clone before using this extra::
+    #     pip install -e /path/to/Faster-Irodori-TTS2
+    "irodori-tts",
+    "safetensors",
+]
 docs = [
     "mkdocs-material",
     "mkdocstrings[python]",

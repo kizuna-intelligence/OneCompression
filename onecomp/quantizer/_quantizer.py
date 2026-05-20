@@ -175,6 +175,11 @@ class Quantizer(metaclass=ABCMeta):
     flag_hessian: bool = False
     flag_xtx: bool = False  # Whether X^T X is needed (e.g., JointQ)
 
+    # Adapter that knows the model's structure (blocks, head, calibration
+    # forward).  Injected by Runner before ``setup``.  ``None`` means
+    # HF causal-LM heuristics apply.
+    adapter: object = field(default=None, repr=False)
+
     def __post_init__(self):
         """__post_init__ method"""
 

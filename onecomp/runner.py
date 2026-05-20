@@ -200,6 +200,17 @@ class Runner:
         self.quantizer = quantizer
         self.quantizers = quantizers
 
+        # Inject the model adapter onto every quantizer so that hooks
+        # like AutoBit's activation-stats collection can dispatch
+        # through the same adapter the Runner uses for forward passes.
+        adapter = getattr(model_config, "adapter", None)
+        if adapter is not None:
+            if quantizer is not None:
+                quantizer.adapter = adapter
+            if quantizers is not None:
+                for q in quantizers:
+                    q.adapter = adapter
+
         if calibration_config is None:
             calibration_config = CalibrationConfig()
         self.calibration_config = calibration_config
@@ -399,7 +410,7 @@ class Runner:
     @classmethod
     def auto_run(
         cls,
-        model_id: str,
+        model_id: Optional[str] = None,
         wbits: Optional[float] = None,
         total_vram_gb: Optional[float] = None,
         groupsize: int = 128,
@@ -408,6 +419,8 @@ class Runner:
         evaluate: bool = True,
         eval_original_model: bool = False,
         save_dir: str = "auto",
+        model_config: Optional[ModelConfig] = None,
+        calibration_config: Optional[CalibrationConfig] = None,
         **kwargs,
     ):
         """One-liner quantization with sensible defaults.
@@ -480,25 +493,60 @@ class Runner:
 
         candidate_bits = (2, 3, 4, 8)
 
+        if model_config is None:
+            if model_id is None:
+                raise ValueError(
+                    "auto_run requires either 'model_id' (HF causal LM) or "
+                    "'model_config' (custom adapter, e.g. DiT)."
+                )
+            model_config = ModelConfig(model_id=model_id, device=device)
+            display_name = model_id
+        else:
+            display_name = model_config.get_model_id_or_path() or "custom-adapter-model"
+
         if wbits is None:
-            from .utils import estimate_wbits_from_vram
+            if model_id is not None:
+                from .utils import estimate_wbits_from_vram
 
-            result = estimate_wbits_from_vram(
-                model_id,
-                total_vram_gb=total_vram_gb,
-                group_size=groupsize,
-                logger=logger,
-            )
-            wbits = math.floor(result.target_bitwidth * 100) / 100
-            logger.info(
-                "VRAM estimation → target wbits=%.2f (%.2f GB total, ratio=80%%)",
-                wbits,
-                result.total_vram_gb,
-            )
+                result = estimate_wbits_from_vram(
+                    model_id,
+                    total_vram_gb=total_vram_gb,
+                    group_size=groupsize,
+                    logger=logger,
+                )
+                wbits = math.floor(result.target_bitwidth * 100) / 100
+                logger.info(
+                    "VRAM estimation → target wbits=%.2f (%.2f GB total, ratio=80%%)",
+                    wbits,
+                    result.total_vram_gb,
+                )
+            else:
+                from .utils import estimate_target_bitwidth
 
-        _id_lower = model_id.lower()
-        is_gemma4 = any(key in _id_lower for key in ("gemma-4", "gemma4", "gemma_4"))
-        model_config = ModelConfig(model_id=model_id, device=device)
+                temp_model = model_config.load_model(device_map="cpu")
+                result = estimate_target_bitwidth(
+                    temp_model,
+                    total_vram_gb=total_vram_gb,
+                    group_size=groupsize,
+                    logger=logger,
+                )
+                wbits = math.floor(result.target_bitwidth * 100) / 100
+                logger.info(
+                    "VRAM estimation (adapter) → target wbits=%.2f (%.2f GB total)",
+                    wbits,
+                    result.total_vram_gb,
+                )
+                del temp_model
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        is_gemma4 = (
+            model_id is not None
+            and any(
+                key in model_id.lower()
+                for key in ("gemma-4", "gemma4", "gemma_4")
+            )
+        )
 
         if is_gemma4:
             valid_wbits = [b for b in candidate_bits if b <= wbits]
@@ -523,24 +571,47 @@ class Runner:
             quantizer = GPTQ(wbits=uniform_bit, groupsize=groupsize, **kwargs)
         else:
             if save_dir == "auto":
-                model_name = model_id.rstrip("/").split("/")[-1]
+                model_name = display_name.rstrip("/").split("/")[-1]
                 save_dir = f"{model_name}-autobit-{wbits}bit"
 
             from .quantizer.autobit import AutoBitQuantizer
+            # ``exclude_layer_keywords`` filters which Linears the ILP
+            # treats as candidates — it must live on the AutoBitQuantizer
+            # parent (not just the GPTQ children) because the candidate
+            # scan walks ``parent._should_quantize_layer``.
+            exclude_layer_keywords = kwargs.pop("exclude_layer_keywords", None)
             candidate_quantizers = [
-                GPTQ(wbits=b, groupsize=groupsize, **kwargs) for b in candidate_bits
+                GPTQ(
+                    wbits=b,
+                    groupsize=groupsize,
+                    exclude_layer_keywords=exclude_layer_keywords,
+                    **kwargs,
+                )
+                for b in candidate_bits
             ]
+            autobit_kwargs = {}
+            if calibration_config is not None:
+                autobit_kwargs["calibration_config"] = calibration_config
             quantizer = AutoBitQuantizer(
                 assignment_strategy="activation_aware",
                 quantizers=candidate_quantizers,
                 target_bit=wbits,
                 save_path=save_dir if save_dir is not None else None,
                 enable_fused_groups=True,
+                exclude_layer_keywords=exclude_layer_keywords,
+                **autobit_kwargs,
             )
-        runner = cls(model_config=model_config, quantizer=quantizer, qep=qep)
+        runner_kwargs = {}
+        if calibration_config is not None:
+            runner_kwargs["calibration_config"] = calibration_config
+        runner = cls(model_config=model_config, quantizer=quantizer, qep=qep, **runner_kwargs)
         runner.run()
 
-        if evaluate:
+        # Perplexity / accuracy evaluation is HF-text-only.  Adapter-driven
+        # configs (DiT, etc.) skip it; users invoke their own audio/image
+        # quality checks downstream.
+        is_hf_text = model_id is not None
+        if evaluate and is_hf_text:
             original_ppl, _, quantized_ppl = runner.calculate_perplexity(
                 original_model=eval_original_model,
             )
@@ -554,6 +625,11 @@ class Runner:
             if eval_original_model:
                 logger.info("Original model accuracy: %s", original_acc)
             logger.info("Quantized model accuracy: %s", quantized_acc)
+        elif evaluate:
+            logger.info(
+                "Skipping perplexity/accuracy evaluation: adapter-driven "
+                "config (no HF tokenizer-based metrics)."
+            )
 
         if save_dir is not None:
             runner.save_quantized_model(save_dir)
@@ -601,7 +677,7 @@ class Runner:
 
         logger.info("Quantizing the model using %s", self.quantizer.name)
         with torch.no_grad():
-            model(**inputs)
+            self.model_config.adapter.run_calibration_forward(model, inputs)
 
         # Remove all hooks
         for handle in handles:
@@ -853,28 +929,26 @@ class Runner:
         self.quantized_model = quantized_model
 
     def prepare_calibration_dataset(self, device, model=None):
-        """Prepare calibration data for quantization methods such as GPTQ.
+        """Prepare calibration data via the configured adapter.
 
-        See calibration.calibration_data_loader.prepare_calibration_dataset for details.
+        Delegates to :meth:`ModelAdapter.prepare_calibration_inputs` so
+        custom architectures (DiT, etc.) can return their own input dict.
+        For HF causal LMs this returns the historical
+        ``{"input_ids", "attention_mask", ...}`` shape.
 
         Args:
-            device (torch.device): Device to place tensors on (CPU or GPU)
-            model: Model instance (optional). Add model-specific fields 
-            (e.g. mm_token_type_ids for Gemma 4).
+            device (torch.device): Device to place tensors on.
+            model: Loaded model (forwarded to adapter; some adapters
+                inspect the model to add per-architecture fields).
 
         Returns:
-            dict: Input dictionary for the model
-                - "input_ids": tensor of shape (num_chunks, max_length)
-                - "attention_mask": tensor of shape (num_chunks, max_length)
+            dict: Input dictionary suitable for ``adapter.run_calibration_forward``.
         """
-        tokenizer = self.model_config.load_tokenizer()
-
-        return prepare_calibration_dataset(
-            tokenizer=tokenizer,
-            device=device,
-            calibration_config=self.calibration_config,
-            logger=self.logger,
+        return self.model_config.adapter.prepare_calibration_inputs(
             model=model,
+            calibration_config=self.calibration_config,
+            device=device,
+            logger=self.logger,
         )
 
     def print_quantization_results(self, quantizer=None):
@@ -1647,12 +1721,20 @@ class Runner:
         modules_in_block = list(quantized_names)
         quant_config["modules_in_block_to_quantize"] = modules_in_block
         quant_config["quantized_layer_names"] = modules_in_block
+        # Adapter-driven models (e.g. DiT) may not expose an HF-style
+        # ``model.config``.  The vLLM/HF quant_config is irrelevant for
+        # them — the adapter writes its own checkpoint metadata — so skip
+        # the rest of the metadata construction entirely.
+        model_config_obj = getattr(model, "config", None)
+        if model_config_obj is None:
+            return model, tokenizer
+
         quant_config = quantizer.finalize_quant_config_for_save(
             quant_config=quant_config,
             quantized_layer_names=quantized_names,
             num_hidden_layers=(
-                getattr(model.config, "num_hidden_layers", None)
-                or getattr(getattr(model.config, "text_config", None), "num_hidden_layers", None)
+                getattr(model_config_obj, "num_hidden_layers", None)
+                or getattr(getattr(model_config_obj, "text_config", None), "num_hidden_layers", None)
             ),
         )
         quant_config["rotated"] = self.model_config.has_additional_data()
@@ -1664,9 +1746,9 @@ class Runner:
         # and passes the weights to UnquantizedFusedMoEMethod.
         # cf) https://docs.vllm.ai/en/stable/features/quantization/#implementing-a-quantized-moe-method
         num_experts = (
-            getattr(model.config, "num_experts", None)
+            getattr(model_config_obj, "num_experts", None)
             or getattr(
-                getattr(model.config, "text_config", None), "num_experts", None
+                getattr(model_config_obj, "text_config", None), "num_experts", None
             )
             or 0
         )
@@ -1779,6 +1861,14 @@ class Runner:
         """
         logger = self.logger
         logger.info("Saving quantized model to %s", save_directory)
+
+        # Adapters that override the save format (e.g. DiT writing
+        # safetensors with bespoke metadata) take full ownership of the
+        # save flow.  HF causal LM continues through the legacy path.
+        adapter = getattr(self.model_config, "adapter", None)
+        from .adapters.hf_llm import HFLLMAdapter as _HFLLMAdapter
+        if adapter is not None and not isinstance(adapter, _HFLLMAdapter):
+            return adapter.save_quantized_model(self, save_directory)
 
         if self.quantized_model is not None:
             logger.info("Using existing quantized model (post-process results preserved)")

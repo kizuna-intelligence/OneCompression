@@ -83,6 +83,7 @@ def assign_by_ilp(quantizer, model, *, use_activation=False):
             calibration_config=quantizer.calibration_config,
             use_curvature_b=quantizer.use_curvature_b,
             logger=logger,
+            adapter=getattr(quantizer, "adapter", None),
         )
 
     # 2. error evaluation (uses per-quantizer groupsize for grouped RTN)

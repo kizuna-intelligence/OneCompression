@@ -21,7 +21,7 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 from torch import nn
-from onecomp.calibration import CalibrationConfig, prepare_calibration_dataset
+from onecomp.calibration import CalibrationConfig
 from onecomp.model_config import ModelConfig
 from onecomp.qep._qep_config import QEPConfig
 from onecomp.quantizer._quantizer import Quantizer
@@ -170,8 +170,12 @@ def compute_hessian_and_crossterm(
         _ = block_q(inps_q[first:last].to(device), **batch_kwargs)
         _ = block_f(inps_f[first:last].to(device), **batch_kwargs)
 
-        x_q = dest["q"].view(-1, hidden_dim).float()
-        x_f = dest["f"].view(-1, hidden_dim).float()
+        # Use ``reshape`` rather than ``view`` because hooks on architectures
+        # that route inputs through transposes / concatenations (e.g. DiT
+        # JointAttention's text/speaker branches) can yield non-contiguous
+        # captured tensors that ``view`` rejects.
+        x_q = dest["q"].reshape(-1, hidden_dim).float()
+        x_f = dest["f"].reshape(-1, hidden_dim).float()
 
         tmp = x_q.size(0)
 
@@ -237,7 +241,7 @@ def _compute_per_module_hessians(
         for i, m in enumerate(modules):
             if i not in dest:
                 continue
-            x = dest[i].view(-1, m.in_features).float()
+            x = dest[i].reshape(-1, m.in_features).float()
             tmp = x.size(0)
             if tmp == 0:
                 continue
@@ -286,22 +290,25 @@ def run_quantize_with_qep_arch(
     batch_size = 16
 
     model = model_config.load_model(device_map="cpu")
-    tokenizer = model_config.load_tokenizer()
     device = qep_config.device
+    adapter = getattr(model_config, "adapter", None)
 
-    model_inputs = prepare_calibration_dataset(
-        tokenizer=tokenizer,
-        device=torch.device("cpu"),
-        calibration_config=calibration_config,
+    model_inputs = adapter.prepare_calibration_inputs(
         model=model,
+        calibration_config=calibration_config,
+        device=torch.device("cpu"),
         logger=logger,
     )
 
     # Setup the quantizer
+    if getattr(quantizer, "adapter", None) is None:
+        quantizer.adapter = adapter
     quantizer.setup(model)
 
     # 1. Prepare transformer blocks and their inputs
-    blocks, inps, kwargs = get_blocks_and_inputs(model, model_inputs, batch_size)
+    blocks, inps, kwargs = get_blocks_and_inputs(
+        model, model_inputs, batch_size, adapter=adapter
+    )
 
     inps_q = inps
     inps_f = inps.clone()

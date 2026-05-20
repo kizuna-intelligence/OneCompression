@@ -8,21 +8,17 @@ Author: Keiji Kimura
 
 from logging import getLogger
 
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-import torch
-
 from .utils.dtype import needs_bfloat16
-
-try:
-    from transformers import AutoModelForImageTextToText as _AutoVLM
-
-    _HAS_VLM_AUTO = True
-except ImportError:
-    _HAS_VLM_AUTO = False
 
 
 class ModelConfig:
-    """Model and Tokenizer"""
+    """Model and Tokenizer configuration.
+
+    Holds either a HuggingFace model id / path (and an auto-constructed
+    :class:`HFLLMAdapter`) or an explicit :class:`ModelAdapter` for
+    non-HF architectures (e.g. :class:`DiTAdapter` for diffusion
+    transformers).
+    """
 
     def __init__(
         self,
@@ -30,105 +26,83 @@ class ModelConfig:
         path: str = None,
         dtype: str = "float16",
         device: str = "auto",
+        adapter=None,
     ):
-        """
+        """__init__ method
+
         Args:
             model_id (str): Model ID (Hugging Face Hub ID).
             path (str): Path to the saved model and tokenizer.
             dtype (str, optional): Data type. Defaults to "float16".
             device (str, optional): Device to use ("cpu", "cuda", "auto"). Defaults to "auto".
+            adapter (ModelAdapter, optional): Custom adapter to use for
+                non-HuggingFace models.  When set, takes precedence over
+                ``model_id`` / ``path``; ``load_model`` and friends
+                delegate to it.
 
         Example:
             >>> model_config = ModelConfig(model_id="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
             >>> model = model_config.load_model()
             >>> tokenizer = model_config.load_tokenizer()
 
+            >>> from onecomp.adapters import DiTAdapter
+            >>> adapter = DiTAdapter(checkpoint_path="...")
+            >>> model_config = ModelConfig(adapter=adapter)
+            >>> model = model_config.load_model()
+
         """
         self.logger = getLogger(__name__)
 
-        if model_id is None and path is None:
-            raise ValueError("Either model_id or path must be provided")
+        if adapter is None and model_id is None and path is None:
+            raise ValueError("Either model_id, path, or adapter must be provided")
 
-        if needs_bfloat16(model_id or path):
-            if dtype != "bfloat16":
-                self.logger.warning(
-                    "Overriding dtype to bfloat16 for %s "
-                    "to prevent performance degradation.",
-                    model_id or path,
-                )
-            dtype = "bfloat16"
+        if adapter is None:
+            if needs_bfloat16(model_id or path):
+                if dtype != "bfloat16":
+                    self.logger.warning(
+                        "Overriding dtype to bfloat16 for %s "
+                        "to prevent performance degradation.",
+                        model_id or path,
+                    )
+                dtype = "bfloat16"
+
+            from .adapters.hf_llm import HFLLMAdapter
+
+            adapter = HFLLMAdapter(
+                model_id=model_id, path=path, dtype=dtype, device=device
+            )
 
         self.model_id = model_id
         self.path = path
         self.dtype = dtype
         self.device = device
-
-        # If additional settings are needed, modify has_additional_data and load_model methods
+        self.adapter = adapter
 
     def get_model_id_or_path(self):
-        """Get the model ID or path"""
+        """Get the model ID or path, or ``None`` for adapter-only configs."""
         if self.model_id is not None:
             return self.model_id
         if self.path is not None:
             return self.path
+        # Adapters with their own loader expose this hook.
+        if hasattr(self.adapter, "get_model_id_or_path"):
+            return self.adapter.get_model_id_or_path()
         return None
 
     def load_config(self):
-        """Load and cache the model config (no weights)."""
-        if not hasattr(self, "_cached_config"):
-            self._cached_config = AutoConfig.from_pretrained(
-                self.get_model_id_or_path(), trust_remote_code=True
-            )
-        return self._cached_config
+        """Load and cache the underlying HuggingFace config (if available)."""
+        if hasattr(self.adapter, "load_config"):
+            return self.adapter.load_config()
+        return None
 
     def load_model(self, device_map=None):
-        """Load the model
-
-        Tries ``AutoModelForCausalLM`` first.  If the model is a
-        Vision-Language Model (e.g. Qwen3-VL) that is not registered
-        with ``AutoModelForCausalLM``, falls back to
-        ``AutoModelForImageTextToText``.
-
-        Args:
-            device_map (str or None):
-                Override the device placement for this load.
-                If ``None`` (default), ``self.device`` is used.
-        """
-        effective_device = device_map if device_map is not None else self.device
-        kwargs = dict(
-            dtype=self.dtype if self.dtype == "auto" else getattr(torch, self.dtype),
-            device_map=effective_device,
-        )
-        try:
-            model = AutoModelForCausalLM.from_pretrained(self.get_model_id_or_path(), **kwargs)
-        except ValueError as e:
-            _vlm_hints = ("Unrecognized configuration class", "Unrecognized model", "is not supported")
-            if not _HAS_VLM_AUTO or not any(h in str(e) for h in _vlm_hints):
-                raise
-            self.logger.info("AutoModelForCausalLM failed; trying AutoModelForImageTextToText.")
-            model = _AutoVLM.from_pretrained(self.get_model_id_or_path(), **kwargs)
-        model.eval()
-        self.logger.info("Model loaded with dtype=%s", next(model.parameters()).dtype)
-        return model
+        """Load the model via the configured adapter."""
+        return self.adapter.load_model(device_map=device_map)
 
     def load_tokenizer(self):
-        """Load the tokenizer"""
-
-        tokenizer = AutoTokenizer.from_pretrained(self.get_model_id_or_path())
-
-        # Handle models without pad_token (e.g., Llama2)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-            self.logger.info("pad_token is not set. Using eos_token as pad_token.")
-
-        return tokenizer
+        """Load the tokenizer via the configured adapter (may return None)."""
+        return self.adapter.load_tokenizer()
 
     def has_additional_data(self):
-        """Check if the model has additional data
-
-        Returns True if there are settings other than `model_id`, `path`, `dtype`, `device`.
-        Currently always returns False. Should return True when additional settings are added.
-
-        """
-
-        return False
+        """Whether the adapter installs extra hooks/state on the model."""
+        return self.adapter.has_additional_data()
