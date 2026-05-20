@@ -2,7 +2,7 @@
 
 Why this exists
 ---------------
-``DiTAdapter.prepare_calibration_inputs`` defaults to *random Gaussian*
+``IrodoriDiTAdapter.prepare_calibration_inputs`` defaults to *random Gaussian*
 tensors.  GPTQ estimates each Linear's Hessian from those activations, so
 random calibration points the error-correction at a distribution the model
 never sees.  On Irodori-TTS-500M-v3 that left speech badly degraded
@@ -12,7 +12,7 @@ This script runs real syntheses and records the exact tensors that flow into
 ``TextToLatentRFDiT.forward_with_encoded_conditions`` at every rectified-flow
 step: the noisy latent ``x_t``, the timestep ``t``, and the (already-encoded,
 un-quantised) ``text_state`` / ``speaker_state`` conditioning.  Feeding these
-back as calibration (via ``DiTAdapter(calibration_inputs_path=...)``) makes the
+back as calibration (via ``IrodoriDiTAdapter(calibration_inputs_path=...)``) makes the
 DiT blocks see exactly the activation statistics of real generation.
 
 Run (inside an irodori_tts-capable venv, e.g. Irodori-streaming/.venv)::

@@ -16,7 +16,7 @@ class ModelConfig:
 
     Holds either a HuggingFace model id / path (and an auto-constructed
     :class:`HFLLMAdapter`) or an explicit :class:`ModelAdapter` for
-    non-HF architectures (e.g. :class:`DiTAdapter` for diffusion
+    non-HF architectures (e.g. :class:`IrodoriDiTAdapter` for diffusion
     transformers).
     """
 
@@ -45,8 +45,8 @@ class ModelConfig:
             >>> model = model_config.load_model()
             >>> tokenizer = model_config.load_tokenizer()
 
-            >>> from onecomp.adapters import DiTAdapter
-            >>> adapter = DiTAdapter(checkpoint_path="...")
+            >>> from onecomp.adapters import IrodoriDiTAdapter
+            >>> adapter = IrodoriDiTAdapter(checkpoint_path="...")
             >>> model_config = ModelConfig(adapter=adapter)
             >>> model = model_config.load_model()
 

@@ -3,7 +3,7 @@
 Demonstrates the full Phase-1 OneCompression pipeline on a non-HuggingFace
 Rectified-Flow text-to-latent diffusion transformer:
 
-    1. Wrap the DiT checkpoint in ``DiTAdapter``.
+    1. Wrap the DiT checkpoint in ``IrodoriDiTAdapter``.
     2. Hand the adapter to ``ModelConfig`` and call ``Runner.auto_run`` —
        VRAM is auto-detected, target bpw is solved from quantizable
        parameter count, and AutoBit's activation-aware ILP assigns each
@@ -27,7 +27,7 @@ import argparse
 import sys
 
 from onecomp import CalibrationConfig, ModelConfig, Runner
-from onecomp.adapters import DiTAdapter
+from onecomp.adapters import IrodoriDiTAdapter
 
 
 def main() -> int:
@@ -95,7 +95,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    adapter = DiTAdapter(
+    adapter = IrodoriDiTAdapter(
         checkpoint_path=args.checkpoint,
         dtype=args.dtype,
         device=args.device,
@@ -117,7 +117,7 @@ def main() -> int:
         evaluate=False,
         save_dir=args.save_dir,
         calibration_config=calibration_config,
-        exclude_layer_keywords=DiTAdapter.default_exclude_layer_keywords(),
+        exclude_layer_keywords=IrodoriDiTAdapter.default_exclude_layer_keywords(),
     )
     return 0
 

@@ -1,9 +1,11 @@
 """Model adapters for plugging non-HuggingFace architectures into OneComp.
 
 The default :class:`HFLLMAdapter` reproduces OneCompression's historical
-behavior for HuggingFace causal LMs.  Custom adapters (e.g.
-:class:`DiTAdapter` for diffusion transformers) are imported lazily so
-that their dependencies (``irodori_tts``, etc.) stay optional.
+behavior for HuggingFace causal LMs.  Diffusion-transformer adapters live
+under :mod:`onecomp.adapters.diffusion`; the architecture-agnostic
+:class:`DiffusionTransformerAdapter` base and concrete subclasses such as
+:class:`IrodoriDiTAdapter` are imported lazily so their optional
+dependencies (``irodori_tts``, ``diffusers``…) stay optional.
 
 Copyright 2025-2026 Fujitsu Ltd.
 """
@@ -13,11 +15,20 @@ from .hf_llm import HFLLMAdapter
 
 
 def __getattr__(name):  # PEP 562 lazy import
-    if name == "DiTAdapter":
-        from .dit import DiTAdapter
+    if name == "DiffusionTransformerAdapter":
+        from .diffusion import DiffusionTransformerAdapter
 
-        return DiTAdapter
+        return DiffusionTransformerAdapter
+    if name == "IrodoriDiTAdapter":
+        from .diffusion import IrodoriDiTAdapter
+
+        return IrodoriDiTAdapter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["ModelAdapter", "HFLLMAdapter", "DiTAdapter"]
+__all__ = [
+    "ModelAdapter",
+    "HFLLMAdapter",
+    "DiffusionTransformerAdapter",
+    "IrodoriDiTAdapter",
+]

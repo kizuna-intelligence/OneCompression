@@ -5,7 +5,7 @@ Encoders / AdaLN / duration_predictor are left in fp16 — on v3 they do not
 survive blind low-bit quantisation (see ``rtn_extra_pass.py`` notes).
 
 Key knob: ``--calib`` points at a real-activation calibration file produced by
-``capture_calibration.py``.  Without it, ``DiTAdapter`` falls back to random
+``capture_calibration.py``.  Without it, ``IrodoriDiTAdapter`` falls back to random
 Gaussian calibration, which on v3 degrades speech intelligibility
 (CER ~33% vs FP32 ~8%).  ``--actorder`` enables activation-order reordering,
 which only helps when the calibration activations are realistic.
@@ -25,7 +25,7 @@ import argparse
 import sys
 
 from onecomp import CalibrationConfig, ModelConfig, Runner, setup_logger
-from onecomp.adapters import DiTAdapter
+from onecomp.adapters import IrodoriDiTAdapter
 from onecomp.quantizer.gptq import GPTQ
 
 
@@ -47,7 +47,7 @@ def main() -> int:
 
     setup_logger()
 
-    adapter = DiTAdapter(
+    adapter = IrodoriDiTAdapter(
         checkpoint_path=args.checkpoint,
         dtype="float32",
         device="cuda:0",
@@ -55,7 +55,7 @@ def main() -> int:
     )
     model_config = ModelConfig(adapter=adapter)
 
-    exclude = DiTAdapter.default_exclude_layer_keywords() + ["duration_predictor"]
+    exclude = IrodoriDiTAdapter.default_exclude_layer_keywords() + ["duration_predictor"]
     gptq = GPTQ(
         wbits=4,
         groupsize=args.groupsize,
