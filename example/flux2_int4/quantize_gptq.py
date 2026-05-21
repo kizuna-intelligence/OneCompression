@@ -40,6 +40,9 @@ def main() -> int:
     ap.add_argument("--mse", action="store_true")
     ap.add_argument("--asym", action="store_true")
     ap.add_argument("--num-samples", type=int, default=64)
+    ap.add_argument("--quant-all", action="store_true",
+                    help="quantize every Linear (empty exclude set), including "
+                         "embedders / modulation / proj_out")
     ap.add_argument("--image-grid", type=int, default=32,
                     help="synthetic latent side length (grid*grid image tokens)")
     ap.add_argument("--text-seq-len", type=int, default=128)
@@ -58,13 +61,14 @@ def main() -> int:
     )
     model_config = ModelConfig(adapter=adapter)
 
+    exclude = [] if args.quant_all else Flux2DiTAdapter.default_exclude_layer_keywords()
     gptq = GPTQ(
         wbits=4,
         groupsize=args.groupsize,
         actorder=args.actorder,
         mse=args.mse,
         sym=not args.asym,
-        exclude_layer_keywords=Flux2DiTAdapter.default_exclude_layer_keywords(),
+        exclude_layer_keywords=exclude,
     )
 
     calib = CalibrationConfig(
