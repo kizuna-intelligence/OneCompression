@@ -26,6 +26,10 @@ def __getattr__(name):  # PEP 562 lazy import
         from .flux2 import Flux2DiTAdapter
 
         return Flux2DiTAdapter
+    if name == "QwenImageDiTAdapter":
+        from .qwenimage import QwenImageDiTAdapter
+
+        return QwenImageDiTAdapter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -33,6 +37,7 @@ __all__ = [
     "DiffusionTransformerAdapter",
     "IrodoriDiTAdapter",
     "Flux2DiTAdapter",
+    "QwenImageDiTAdapter",
     "Sampler",
     "GaussianNoise",
     "UniformTimestep",
