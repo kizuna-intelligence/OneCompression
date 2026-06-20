@@ -90,11 +90,16 @@ class Catcher(nn.Module):
     # Names that conventionally hold the block's primary input tensor.
     _INPUT_KWARG_NAMES = ("x", "hidden_states", "input")
 
-    def __init__(self, module: nn.Module):
+    def __init__(self, module: nn.Module, pack_fn=None):
         super().__init__()
         self.module = module
         self.inp = None
         self.kwargs = {}
+        # Optional adapter hook for multi-stream blocks (e.g. dual-stream
+        # MMDiT): ``pack_fn(args, kwargs) -> (packed_inp, residual_kwargs)``
+        # collapses several evolving residual streams into a single tensor so
+        # the single-stream block-propagation loop can carry them together.
+        self.pack_fn = pack_fn
 
     def __getattr__(self, name: str):
         try:
@@ -103,7 +108,9 @@ class Catcher(nn.Module):
             return getattr(self.module, name)
 
     def forward(self, *args, **kwargs):
-        if args:
+        if self.pack_fn is not None:
+            inp, kwargs = self.pack_fn(args, kwargs)
+        elif args:
             inp = args[0]
         else:
             inp = None
@@ -125,6 +132,7 @@ class Catcher(nn.Module):
 _PER_LAYER_INPUTS_KEY = "_per_layer_inputs"
 _POS_EMB_MAP_KEY = "_position_embeddings_map"
 _ATTN_MASK_MAP_KEY = "_attention_mask_map"
+_PER_BLOCK_KWARGS_KEY = "_per_block_kwargs"
 
 
 def _find_blocks_parent(model, blocks):
@@ -214,6 +222,31 @@ def get_blocks_and_inputs(
 
     blocks = _get_blocks(model, adapter=adapter)
 
+    # Opt-in multi-stream support: an adapter for a dual-stream architecture
+    # (e.g. Qwen-Image / FireRed MMDiT) can supply ``wrap_block`` (collapse a
+    # block's several evolving residual streams into a single packed tensor)
+    # and ``pack_catcher_input`` (pack the captured block input the same way).
+    # Wrappers reuse the *same* Linear submodule objects, so the quantizer's
+    # ``module_to_name`` map (built on the unwrapped model before this call)
+    # stays valid and module names stay clean for saving.
+    pack_fn = None
+    if adapter is not None:
+        wrap_block = getattr(adapter, "wrap_block", None)
+        pack_catcher = getattr(adapter, "pack_catcher_input", None)
+        if callable(wrap_block) and callable(pack_catcher):
+            wrapped_any = False
+            for i in range(len(blocks)):
+                w = wrap_block(blocks[i])
+                if w is not None:
+                    blocks[i] = w
+                    wrapped_any = True
+            if wrapped_any:
+                pack_fn = pack_catcher
+                logger.info(
+                    "Stream-packing enabled (adapter=%s): %d blocks wrapped.",
+                    type(adapter).__name__, len(blocks),
+                )
+
     # Detect models with heterogeneous layer types (e.g. Gemma4 with
     # full_attention / sliding_attention).  Adapter-driven flows skip
     # this entirely (custom architectures handle layer-type dispatch
@@ -243,7 +276,7 @@ def get_blocks_and_inputs(
                 )
 
     # replace the first transformer block with a input catcher.
-    blocks[0] = Catcher(blocks[0])
+    blocks[0] = Catcher(blocks[0], pack_fn=pack_fn)
 
     if adapter is None:
         inp_ids = model_inputs["input_ids"]
@@ -449,7 +482,41 @@ def prepare_block_kwargs(batch_kwargs, block, pli, offset, batch_size, device):
         if layer_type and layer_type in mask_map:
             batch_kwargs["attention_mask"] = mask_map[layer_type]
 
+    # 4) Adapter-provided per-block kwargs, e.g. Cosmos ControlNet residuals.
+    per_block = batch_kwargs.pop(_PER_BLOCK_KWARGS_KEY, None)
+    if per_block is not None:
+        block_idx = getattr(block, "_onecomp_block_idx", None)
+        if block_idx is None:
+            block_idx = getattr(getattr(block, "block", None), "_onecomp_block_idx", None)
+        if block_idx is not None:
+            block_extra = None
+            if isinstance(per_block, dict):
+                block_extra = per_block.get(int(block_idx))
+            elif isinstance(per_block, (list, tuple)) and int(block_idx) < len(per_block):
+                block_extra = per_block[int(block_idx)]
+            if isinstance(block_extra, dict):
+                for key, value in block_extra.items():
+                    if value is None:
+                        batch_kwargs[key] = None
+                    else:
+                        batch_kwargs[key] = move_kwargs_to_device(
+                            _slice_block_kwarg(value, offset, batch_size),
+                            device,
+                        )
+
     return batch_kwargs
+
+
+def _slice_block_kwarg(value, offset, batch_size):
+    if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] > batch_size:
+        return value[offset : offset + batch_size]
+    if isinstance(value, tuple):
+        return tuple(_slice_block_kwarg(v, offset, batch_size) for v in value)
+    if isinstance(value, list):
+        return [_slice_block_kwarg(v, offset, batch_size) for v in value]
+    if isinstance(value, dict):
+        return {k: _slice_block_kwarg(v, offset, batch_size) for k, v in value.items()}
+    return value
 
 
 @torch.no_grad()

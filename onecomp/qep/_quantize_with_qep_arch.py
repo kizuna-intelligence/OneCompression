@@ -509,4 +509,13 @@ def run_quantize_with_qep_arch(
         block_q.cpu()
         torch.cuda.empty_cache()
 
+    # Unwrap any stream-packing wrappers so the model exposes its original
+    # block structure (clean module names) for saving.  Wrappers reuse the
+    # real Linear objects, so the quantized weights live in the restored
+    # blocks.
+    for i in range(len(blocks)):
+        real = getattr(blocks[i], "_onecomp_wrapped_block", None)
+        if real is not None:
+            blocks[i] = real
+
     quantizer.execute_post_processing()

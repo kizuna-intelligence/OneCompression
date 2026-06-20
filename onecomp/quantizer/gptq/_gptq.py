@@ -634,6 +634,16 @@ def run_gptq(  # pylint: disable=too-many-positional-arguments
 
     # layer.weight.data = Q.reshape(layer.weight.shape).to(layer.weight.data.dtype) # original code
     quantized_weight = Q_int.reshape(layer.weight.shape).cpu()
+    # qweight holds integer codes in [0, 2**wbits-1].  Keeping the full unpacked
+    # matrix as int32 means the accumulated `quantizer.results` dict grows to
+    # ~4 bytes * total_params (e.g. ~108GB for a 27B model), which OOM-kills the
+    # host long before the per-block bit-packing that only happens at save time.
+    # For wbits<=8 the codes fit in a single byte, so store uint8: a 4x smaller
+    # footprint.  Both downstream consumers up-cast (_pack_rows via .int(),
+    # GPTQResult.compute_dequantized_weight via .to(torch.int32)), so this is
+    # transparent.
+    if wbits <= 8:
+        quantized_weight = quantized_weight.to(torch.uint8)
 
     if groupsize != -1:
         scale = all_scales.to(dtype=torch.float16, device="cpu").T

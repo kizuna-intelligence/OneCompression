@@ -31,6 +31,14 @@ def __getattr__(name):  # PEP 562 lazy import
         from .diffusion import QwenImageDiTAdapter
 
         return QwenImageDiTAdapter
+    if name == "CosmosTransferDiTAdapter":
+        from .diffusion import CosmosTransferDiTAdapter
+
+        return CosmosTransferDiTAdapter
+    if name == "CosmosOfficialMultibranchAdapter":
+        from .diffusion import CosmosOfficialMultibranchAdapter
+
+        return CosmosOfficialMultibranchAdapter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -41,4 +49,6 @@ __all__ = [
     "IrodoriDiTAdapter",
     "Flux2DiTAdapter",
     "QwenImageDiTAdapter",
+    "CosmosTransferDiTAdapter",
+    "CosmosOfficialMultibranchAdapter",
 ]
