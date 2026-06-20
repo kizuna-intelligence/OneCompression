@@ -39,6 +39,10 @@ def __getattr__(name):  # PEP 562 lazy import
         from .diffusion import CosmosOfficialMultibranchAdapter
 
         return CosmosOfficialMultibranchAdapter
+    if name == "WanVACE14BDiTAdapter":
+        from .diffusion import WanVACE14BDiTAdapter
+
+        return WanVACE14BDiTAdapter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -51,4 +55,5 @@ __all__ = [
     "QwenImageDiTAdapter",
     "CosmosTransferDiTAdapter",
     "CosmosOfficialMultibranchAdapter",
+    "WanVACE14BDiTAdapter",
 ]

@@ -38,6 +38,10 @@ def __getattr__(name):  # PEP 562 lazy import
         from .cosmos_official_multibranch import CosmosOfficialMultibranchAdapter
 
         return CosmosOfficialMultibranchAdapter
+    if name == "WanVACE14BDiTAdapter":
+        from .wan_vace import WanVACE14BDiTAdapter
+
+        return WanVACE14BDiTAdapter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -48,6 +52,7 @@ __all__ = [
     "QwenImageDiTAdapter",
     "CosmosTransferDiTAdapter",
     "CosmosOfficialMultibranchAdapter",
+    "WanVACE14BDiTAdapter",
     "Sampler",
     "GaussianNoise",
     "UniformTimestep",
