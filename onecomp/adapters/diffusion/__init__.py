@@ -38,6 +38,10 @@ def __getattr__(name):  # PEP 562 lazy import
         from .cosmos_official_multibranch import CosmosOfficialMultibranchAdapter
 
         return CosmosOfficialMultibranchAdapter
+    if name == "CosmosPredictDiTAdapter":
+        from .cosmos_predict import CosmosPredictDiTAdapter
+
+        return CosmosPredictDiTAdapter
     if name == "WanVACE14BDiTAdapter":
         from .wan_vace import WanVACE14BDiTAdapter
 
@@ -52,6 +56,7 @@ __all__ = [
     "QwenImageDiTAdapter",
     "CosmosTransferDiTAdapter",
     "CosmosOfficialMultibranchAdapter",
+    "CosmosPredictDiTAdapter",
     "WanVACE14BDiTAdapter",
     "Sampler",
     "GaussianNoise",

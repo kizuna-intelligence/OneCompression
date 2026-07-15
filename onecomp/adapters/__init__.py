@@ -39,6 +39,10 @@ def __getattr__(name):  # PEP 562 lazy import
         from .diffusion import CosmosOfficialMultibranchAdapter
 
         return CosmosOfficialMultibranchAdapter
+    if name == "CosmosPredictDiTAdapter":
+        from .diffusion import CosmosPredictDiTAdapter
+
+        return CosmosPredictDiTAdapter
     if name == "WanVACE14BDiTAdapter":
         from .diffusion import WanVACE14BDiTAdapter
 
@@ -55,5 +59,6 @@ __all__ = [
     "QwenImageDiTAdapter",
     "CosmosTransferDiTAdapter",
     "CosmosOfficialMultibranchAdapter",
+    "CosmosPredictDiTAdapter",
     "WanVACE14BDiTAdapter",
 ]
