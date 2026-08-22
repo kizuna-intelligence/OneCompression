@@ -173,3 +173,60 @@ class RTN(Quantizer):
             scale=result_dict["scale"],
             zero=result_dict["zero"],
         )
+
+    # ========================================
+    # Save / inference layer (packed GPTQ format)
+    # ========================================
+    def get_quant_config(self) -> dict:
+        """Return the quantization_config dict for save_quantized_model.
+
+        RTN reuses the AutoGPTQ-v1 on-disk layout (qweight / scales / qzeros),
+        so packed RTN checkpoints load through the same ``GPTQLinear`` /
+        GemLite path as GPTQ checkpoints — only ``quant_method`` differs.
+        """
+        return {
+            "quant_method": "rtn",
+            "bits": self.wbits,
+            "groupsize": self.groupsize,
+            "group_size": self.groupsize,
+            "actorder": False,
+            "desc_act": False,
+            "sym": self.sym,
+            "checkpoint_format": "gptq",
+        }
+
+    def create_inference_layer(self, result, linear_module, **kwargs):
+        """Build a packed ``GPTQLinear`` from an :class:`RTNResult`.
+
+        RTN stores ``scale`` / ``zero`` as ``(out_features, num_groups)`` and
+        the integer ``quantized_weight`` as ``(out_features, in_features)``;
+        ``GPTQLinear`` expects ``scale`` / ``zero`` as ``(num_groups,
+        out_features)`` (it applies the AutoGPTQ-v1 ``-1`` zero offset and the
+        bit-packing itself), so we only transpose. RTN has no activation
+        reordering, hence ``actorder=False`` and ``perm=None``.
+        """
+        from onecomp.quantizer.gptq.gptq_layer import GPTQLinear
+
+        out_features, in_features = result.quantized_weight.shape
+        scale = result.scale.t().contiguous()  # (out, num_groups) -> (num_groups, out)
+        zero = result.zero.t().contiguous()
+        bias = (
+            linear_module.bias
+            if getattr(linear_module, "bias", None) is not None
+            else None
+        )
+        return GPTQLinear(
+            in_features=in_features,
+            out_features=out_features,
+            wbits=result.wbits,
+            groupsize=result.groupsize,
+            actorder=False,
+            quantized_weight=result.quantized_weight,
+            scale=scale,
+            zero=zero,
+            perm=None,
+            bias=bias,
+            device=linear_module.weight.device,
+            pack_weights=kwargs.get("pack_weights", True),
+            use_gemlite=kwargs.get("use_gemlite"),
+        )

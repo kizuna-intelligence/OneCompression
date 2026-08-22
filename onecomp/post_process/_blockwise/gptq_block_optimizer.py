@@ -40,7 +40,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .helpers import layer_kwargs_to_device
+from ...utils.blockwise import (
+    _PER_LAYER_INPUTS_KEY,
+    expand_kwargs_batch,
+    prepare_block_kwargs,
+)
 
 logger = getLogger(__name__)
 
@@ -176,11 +180,13 @@ def _make_differentiable_forward(mod: nn.Module, use_intweight_param: bool = Fal
 
 
 def _compute_block_mse(layer, inps, target_outputs, layer_kwargs, dev):
-    kw_gpu = layer_kwargs_to_device(layer_kwargs, dev)
+    pli = layer_kwargs.get(_PER_LAYER_INPUTS_KEY)
     with torch.no_grad():
         total_error = 0.0
         for j in range(len(inps)):
             inp_gpu = inps[j].unsqueeze(0).to(dev)
+            kw_gpu = expand_kwargs_batch(layer_kwargs, 1)
+            kw_gpu = prepare_block_kwargs(kw_gpu, layer, pli, j, 1, dev)
             raw = layer(inp_gpu, **kw_gpu)
             out = raw[0] if isinstance(raw, tuple) else raw
             tgt = target_outputs[j].to(dev)
@@ -355,8 +361,8 @@ def optimize_gptq_block(
     optimizer = torch.optim.Adam(param_groups)
 
     n_samples = len(inps)
-    kw_gpu = layer_kwargs_to_device(layer_kwargs, dev)
     total_steps = epochs * n_samples
+    pli = layer_kwargs.get(_PER_LAYER_INPUTS_KEY)
 
     best_eval_mse = initial_error
     best_state = {}
@@ -396,6 +402,8 @@ def optimize_gptq_block(
 
                 inp_gpu = inps[j].unsqueeze(0).detach().to(dev)
                 target_gpu = target_outputs[j].detach().to(dev)
+                kw_gpu = expand_kwargs_batch(layer_kwargs, 1)
+                kw_gpu = prepare_block_kwargs(kw_gpu, layer, pli, j, 1, dev)
 
                 optimizer.zero_grad()
                 out = _layer_output(layer, inp_gpu, kw_gpu)
@@ -485,5 +493,4 @@ def optimize_gptq_block(
         pct,
     )
 
-    del kw_gpu
     return initial_error, final_error

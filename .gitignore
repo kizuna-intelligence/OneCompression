@@ -1,5 +1,6 @@
 *.swp
 __pycache__
+.claude/
 *.egg-info
 dist/
 build/
@@ -28,3 +29,8 @@ tests/onecomp/quantizer/jointq/data/model_layers_0_self_attn_k_proj.pth
 .uv-sync-vllm.lock
 .uv-sync-vllm.done
 .venv-vllm/
+.venv-flux/
+# Quantization output dirs (regenerate via example scripts)
+/flux2_int4*/
+/flux2_te_*/
+/outputs/

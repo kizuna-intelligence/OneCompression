@@ -175,6 +175,11 @@ class Quantizer(metaclass=ABCMeta):
     flag_hessian: bool = False
     flag_xtx: bool = False  # Whether X^T X is needed (e.g., JointQ)
 
+    # Adapter that knows the model's structure (blocks, head, calibration
+    # forward).  Injected by Runner before ``setup``.  ``None`` means
+    # HF causal-LM heuristics apply.
+    adapter: object = field(default=None, repr=False)
+
     def __post_init__(self):
         """__post_init__ method"""
 
@@ -355,11 +360,38 @@ class Quantizer(metaclass=ABCMeta):
         hessian[dead, dead] = 1
         weight[:, dead] = 0
 
-        # QEP correction
-        damp = percdamp * torch.mean(torch.diag(hessian))
+        # QEP correction.  Wide MLP layers (e.g. Qwen-Image img_mlp/txt_mlp,
+        # DeepSeek experts) can produce a Hessian that is non-positive-definite
+        # at the configured damping, even with a well-sampled calibration set —
+        # highly anisotropic activations leave near-zero eigenvalues that
+        # ``percdamp`` does not lift.  Escalate the diagonal damping (the
+        # standard GPTQ robustness pattern) until the Cholesky succeeds; an
+        # already-PD matrix factorizes on the first try, so results are
+        # unchanged for the common case.
         diag = torch.arange(hessian.shape[0], device=hessian.device)
-        hessian[diag, diag] += damp
-        cholesky = torch.linalg.cholesky(hessian)
+        mean_diag = torch.mean(torch.diag(hessian))
+        applied = 0.0
+        cholesky = None
+        for damp_frac in (percdamp, 0.05, 0.1, 0.2):
+            if damp_frac <= applied:
+                continue
+            hessian[diag, diag] += (damp_frac - applied) * mean_diag
+            applied = damp_frac
+            try:
+                cholesky = torch.linalg.cholesky(hessian)
+                break
+            except torch.linalg.LinAlgError:
+                continue
+        if cholesky is None:
+            raise torch.linalg.LinAlgError(
+                "Hessian not positive-definite even at 20% damping during QEP "
+                "weight adjustment"
+            )
+        if applied > percdamp:
+            self.logger.warning(
+                "QEP adjust_weight: escalated Hessian damping %.3g -> %.3g for a "
+                "non-positive-definite layer", percdamp, applied,
+            )
         rhs = weight @ delta_hatX
         delta_weight = torch.cholesky_solve(rhs.t(), cholesky).t()
         weight = weight + (perccorr * delta_weight)
@@ -575,6 +607,18 @@ class Quantizer(metaclass=ABCMeta):
             )
             setattr(parent, attr_name, quantized_layer)
             self.logger.debug("Replaced %s with %s", name, quantized_layer.__class__.__name__)
+            # Free the result's raw weight tensors now that they have been packed
+            # into the inference layer (which holds independent copies).  For a
+            # large model the per-layer ``dequantized_weight``/``quantized_weight``
+            # add up to a full extra model in RAM; releasing them as we go keeps
+            # the save-time peak well under the original-model + repacked-model
+            # sum.  ``_collect_quant_layers`` only reads result keys/metadata, so
+            # dropping the heavy tensors is safe.
+            if kwargs.get("pack_weights", True):
+                for _attr in ("dequantized_weight", "quantized_weight", "scale", "zero"):
+                    if hasattr(result, _attr):
+                        setattr(result, _attr, None)
+            del linear_module, quantized_layer
         if self.results:
             first_name = next(iter(self.results))
             *parent_path, attr_name = first_name.split(".")
@@ -869,7 +913,12 @@ class Quantizer(metaclass=ABCMeta):
 
         device = module.weight.data.device
         matrix_W = module.weight.data.detach()
-        dequantized_weight_device = dequantized_weight.to(device)
+        # ``dequantized_weight`` is stored fp16 by the GPTQ/RTN results; the
+        # original weight (and captured activations) may be bf16, so match the
+        # weight dtype to avoid a Half/BFloat16 matmul dtype mismatch.
+        dequantized_weight_device = dequantized_weight.to(
+            device=device, dtype=matrix_W.dtype
+        )
 
         # Flatten to (total_samples, in_features)
         flat_input = input_activations.reshape(-1, input_activations.shape[-1])

@@ -84,7 +84,14 @@ def run_rtn(
         Q_int = Q_int.t()
 
     dequantized_weight = Q.reshape(layer.weight.shape).to(layer.weight.data.dtype).cpu()
+    # Store the integer codes compactly.  ``Q_int`` comes back as fp32 (same
+    # dtype as the float weight), which for a 20B model is ~82GB held across all
+    # results -- enough to OOM the host during save.  For <=8-bit the codes fit
+    # in a uint8 (1/4 the bytes), and ``pack_int_weights`` casts back to int
+    # before packing, so this is lossless for the packed-save path.
     quantized_weight = Q_int.reshape(layer.weight.shape).cpu()
+    if wbits <= 8:
+        quantized_weight = quantized_weight.round().to(torch.uint8)
 
     scale = scale.reshape(-1, scale.shape[-1]).to(dtype=torch.float16, device="cpu")
     zero = zero_point.reshape(-1, zero_point.shape[-1]).to(dtype=torch.float16, device="cpu")

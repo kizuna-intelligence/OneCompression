@@ -49,11 +49,23 @@ def _pack_rows(matrix: torch.Tensor, wbits: int) -> torch.Tensor:
     # This also covers the GPTQ v1 qzero=0 case, where qzero - 1 is stored as -1.
     mask = (1 << wbits) - 1
 
+    # Pack granularity: 2/4/8-bit fit 32//wbits values per INT32 word; 3-bit uses
+    # a 32-value→3-word block.  Mixed-precision assignment can hand 3-bit to small
+    # linear-attention projections whose packed dim (e.g. out_features=48) is not a
+    # multiple of 32, which used to assert-fail at save time.  Zero-pad the packed
+    # dim up to the block size; the unpackers (`_unpack_rows`) already slice back to
+    # the original ``num_rows``, so the round-trip is exact.
+    block = 32 if wbits == 3 else (32 // wbits)
+    if rows % block != 0:
+        pad = block - (rows % block)
+        matrix = torch.cat(
+            [matrix, torch.zeros(pad, cols, dtype=matrix.dtype, device=matrix.device)],
+            dim=0,
+        )
+        rows = matrix.shape[0]
+
     if wbits in (2, 4, 8):
         pack_factor = 32 // wbits
-        assert (
-            rows % pack_factor == 0
-        ), f"rows ({rows}) must be divisible by pack_factor ({pack_factor})"
         reshaped = matrix.reshape(rows // pack_factor, pack_factor, cols)
         packed = torch.zeros(rows // pack_factor, cols, dtype=torch.int32, device=matrix.device)
         for i in range(pack_factor):
@@ -61,8 +73,8 @@ def _pack_rows(matrix: torch.Tensor, wbits: int) -> torch.Tensor:
         return packed
 
     if wbits == 3:
-        # 32 values → 96 bits → 3 INT32s (continuous bit-stream, no waste)
-        assert rows % 32 == 0, f"rows ({rows}) must be divisible by 32 for 3-bit packing"
+        # 32 values → 96 bits → 3 INT32s (continuous bit-stream, no waste).
+        # rows is guaranteed a multiple of 32 here (padded above if needed).
         num_blocks = rows // 32
         reshaped = matrix.reshape(num_blocks, 32, cols)
         packed = torch.zeros(num_blocks, 3, cols, dtype=torch.int32, device=matrix.device)

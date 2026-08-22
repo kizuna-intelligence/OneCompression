@@ -80,6 +80,14 @@ class QuantizedModelLoader:
         # Load state_dict from safetensors
         state_dict = cls._load_state_dict_from_dir(save_directory)
 
+        # Reconcile checkpoint keys with the skeleton's key namespace. A text
+        # decoder extracted from a VL model is saved with nested keys
+        # (``model.language_model.layers.X...``) but rebuilt here as a standalone
+        # CausalLM whose keys are ``model.layers.X...``. Without this step
+        # ``load_state_dict(strict=False)`` silently skips every quantized buffer
+        # and the model loads with zero weights.
+        state_dict = cls._reconcile_state_dict_keys(model, state_dict)
+
         # Replace quantized layers with empty modules
         cls._replace_quantized_layers(model, state_dict, quant_config)
 
@@ -247,6 +255,49 @@ class QuantizedModelLoader:
             from transformers import AutoModelForImageTextToText
 
             return AutoModelForImageTextToText.from_config(model_config, torch_dtype=dtype)
+
+    @staticmethod
+    def _reconcile_state_dict_keys(model, state_dict: dict) -> dict:
+        """Strip an extra nesting prefix from checkpoint keys when the skeleton
+        does not have it.
+
+        Handles the common VL-extracted-decoder case where the checkpoint keys
+        carry ``model.language_model.`` (or a bare ``language_model.``) but the
+        rebuilt standalone CausalLM expects ``model.`` (or no prefix). Only keys
+        absent from the model's own state_dict are candidates for remapping, and
+        a remap is applied only when it produces a key the model actually has.
+        """
+        model_keys = set(model.state_dict().keys())
+        missing = [k for k in state_dict if k not in model_keys]
+        if not missing:
+            return state_dict
+
+        # Candidate prefix transforms, most specific first.
+        transforms = [
+            ("model.language_model.", "model."),
+            ("language_model.", ""),
+        ]
+        remapped: dict = {}
+        n_fixed = 0
+        for k, v in state_dict.items():
+            nk = k
+            if k not in model_keys:
+                for old, new in transforms:
+                    if k.startswith(old):
+                        cand = new + k[len(old):]
+                        if cand in model_keys:
+                            nk = cand
+                            n_fixed += 1
+                        break
+            remapped[nk] = v
+
+        if n_fixed:
+            logger.warning(
+                "Reconciled %d checkpoint keys to the model namespace "
+                "(stripped VL nesting prefix).",
+                n_fixed,
+            )
+        return remapped
 
     @staticmethod
     def _set_module_by_name(

@@ -8,14 +8,16 @@ Author: Keiji Kimura
 
 from logging import getLogger
 
-from lm_eval import evaluator
-from lm_eval.models.huggingface import HFLM
-
 logger = getLogger(__name__)
 
 
 def _create_eval_model(model, tokenizer, batch_size):
     """Helper function to create an evaluation model for lm_eval."""
+    # Lazy import — ``lm_eval`` (and its transitive transformers /
+    # accelerate constraints) is only needed for HF perplexity/accuracy
+    # evaluation.  Adapter-driven configs (DiT, etc.) that skip
+    # evaluate=True never trigger this import.
+    from lm_eval.models.huggingface import HFLM
     original_quantization_config = None
     should_restore_quantization_config = False
     if hasattr(model, "config") and getattr(model.config, "quantization_config", None) is not None:
@@ -111,6 +113,8 @@ def calculate_accuracy(
     # calculate the accuracy
     if tasks is None:
         tasks = ["arc_easy", "arc_challenge", "piqa", "winogrande"]
+
+    from lm_eval import evaluator
 
     results = evaluator.simple_evaluate(
         model=eval_model,
