@@ -103,7 +103,10 @@ class ComposeModelAdapter(HFLLMAdapter):
                 text = record.get("text")
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError(f"empty Canto calibration prompt at row {index}")
-                token_ids = tokenizer(text, add_special_tokens=True)["input_ids"]
+                # Match modeling_internlm2.py::inference, which wraps the
+                # prompt in the same user turn before tokenization.
+                wrapped = f"[UNUSED_TOKEN_146]user\n{text}[UNUSED_TOKEN_145]\n"
+                token_ids = tokenizer(wrapped, add_special_tokens=True)["input_ids"]
                 if token_ids and isinstance(token_ids[0], list):
                     token_ids = token_ids[0]
                 if len(token_ids) > length:
