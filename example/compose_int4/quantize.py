@@ -25,7 +25,7 @@ from compose_int4.model_adapters import ComposeModelAdapter  # noqa: E402
 
 GROUP_SIZE = 32
 WBITS = 4
-QEP_EXCLUDE_LAYER_KEYWORDS = ["mlp.down_proj"]
+QEP_EXCLUDE_LAYER_KEYWORDS = ["mlp.down_proj", "Plora_A", "Plora_B"]
 GPTQ_EXCLUDE_LAYER_KEYWORDS: list[str] = []
 REMOTE_CODE = {
     "yue2": ("modeling_yue2.py",),
@@ -104,8 +104,10 @@ def main() -> None:
         include_layer_keywords=["model.layers."],
     )
     # All decoder Linear modules, including SongComposer's fused wqkv and
-    # PLoRA A/B sublayers, use GPTQ. QEP keeps its documented default
-    # down_proj correction exclusion.
+    # PLoRA A/B sublayers, use GPTQ. Text-only calibration does not exercise
+    # the image-masked PLoRA branch, whose QEP adjustment Hessian is not
+    # positive-definite at the supported 20% damping ceiling, so omit only
+    # that correction along with the documented down_proj default.
     runner = Runner(
         model_config=model_config,
         quantizer=quantizer,
