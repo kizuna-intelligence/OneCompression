@@ -26,6 +26,7 @@ from compose_int4.model_adapters import ComposeModelAdapter  # noqa: E402
 GROUP_SIZE = 32
 WBITS = 4
 QEP_EXCLUDE_LAYER_KEYWORDS = ["mlp.down_proj", "Plora_A", "Plora_B"]
+GPTQ_EXCLUDE_LAYER_KEYWORDS = ["Plora_A", "Plora_B"]
 REMOTE_CODE = {
     "yue2": ("modeling_yue2.py",),
     "songcomposer": (
@@ -101,11 +102,13 @@ def main() -> None:
         groupsize=GROUP_SIZE,
         actorder=False,
         include_layer_keywords=["model.layers."],
+        exclude_layer_keywords=GPTQ_EXCLUDE_LAYER_KEYWORDS,
     )
-    # SongComposer's PLoRA A/B sublayers only contribute on image-masked
-    # positions. These text-only calibration prompts do not exercise that
-    # branch, and QEP cannot form a stable correction Hessian for it. Keep
-    # GPTQ quantization on those weights, but omit QEP correction there.
+    # SongComposer's PLoRA A/B sublayers contribute only on image-masked
+    # positions. The calibration prompts are text-only; after GPTQ quantized
+    # these modules, a downstream Hessian became non-finite. Keep this small
+    # image branch in its source dtype, while quantizing the main decoder
+    # linears.
     runner = Runner(
         model_config=model_config,
         quantizer=quantizer,
@@ -153,6 +156,7 @@ def main() -> None:
         "actorder": False,
         "qep": True,
         "qep_exclude_layer_keywords": QEP_EXCLUDE_LAYER_KEYWORDS,
+        "gptq_exclude_layer_keywords": GPTQ_EXCLUDE_LAYER_KEYWORDS,
         "dtype": dtype,
         "quantization_seconds": quantization_seconds,
         "save_seconds": save_seconds,
