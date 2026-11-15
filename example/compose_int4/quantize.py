@@ -25,7 +25,12 @@ from compose_int4.model_adapters import ComposeModelAdapter  # noqa: E402
 
 GROUP_SIZE = 32
 WBITS = 4
-QEP_EXCLUDE_LAYER_KEYWORDS = ["mlp.down_proj", "Plora_A", "Plora_B"]
+QEP_EXCLUDE_LAYER_KEYWORDS = [
+    "mlp.down_proj",
+    "Plora_A",
+    "Plora_B",
+    "model.layers.0.attention.wo",
+]
 GPTQ_EXCLUDE_LAYER_KEYWORDS = ["Plora_A", "Plora_B"]
 REMOTE_CODE = {
     "yue2": ("modeling_yue2.py",),
@@ -109,7 +114,9 @@ def main() -> None:
     # even after using the checkpoint's pad_token_id, so keep that small
     # branch in source dtype. The fused base wqkv and other decoder linears
     # remain GPTQ int4. QEP also omits correction for PLoRA and the documented
-    # down_proj default.
+    # down_proj default. The first block's attention.wo adjustment Hessian is
+    # not positive-definite at 20% damping, so omit only that correction while
+    # GPTQ still quantizes the projection.
     runner = Runner(
         model_config=model_config,
         quantizer=quantizer,
