@@ -32,8 +32,23 @@ class ComposeModelAdapter(HFLLMAdapter):
 
         selected_map = self.device if device_map is None else device_map
         dtype = getattr(torch, self.dtype)
+        config = self.load_config()
+        if self.model_kind == "songcomposer" and not hasattr(config, "max_length"):
+            # Transformers 5 no longer exposes this checkpoint field on the
+            # custom config class, while the saved remote model code reads it
+            # during __init__. Preserve the value recorded by the checkpoint.
+            raw_config = json.loads(
+                (Path(self.get_model_id_or_path()) / "config.json").read_text(encoding="utf-8")
+            )
+            max_length = raw_config.get(
+                "max_length", getattr(config, "max_position_embeddings", None)
+            )
+            if not isinstance(max_length, int) or max_length <= 0:
+                raise ValueError("SongComposer config must provide a positive max_length")
+            config.max_length = max_length
         model = AutoModelForCausalLM.from_pretrained(
             self.get_model_id_or_path(),
+            config=config,
             trust_remote_code=True,
             local_files_only=True,
             dtype=dtype,
