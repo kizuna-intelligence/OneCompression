@@ -143,8 +143,11 @@ class ComposeModelAdapter(HFLLMAdapter):
                     value
                     for value in (
                         getattr(tokenizer, "pad_token_id", None),
+                        getattr(model.config, "pad_token_id", None),
                         getattr(tokenizer, "eos_token_id", None),
+                        getattr(model.config, "eos_token_id", None),
                         getattr(tokenizer, "bos_token_id", None),
+                        getattr(model.config, "bos_token_id", None),
                         0,
                     )
                     if value is not None

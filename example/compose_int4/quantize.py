@@ -25,18 +25,8 @@ from compose_int4.model_adapters import ComposeModelAdapter  # noqa: E402
 
 GROUP_SIZE = 32
 WBITS = 4
-QEP_EXCLUDE_LAYER_KEYWORDS = [
-    "mlp.down_proj",
-    "Plora_A",
-    "Plora_B",
-    "model.layers.0.attention.wqkv",
-    "model.layers.0.attention.wo",
-]
-GPTQ_EXCLUDE_LAYER_KEYWORDS = [
-    "Plora_A",
-    "Plora_B",
-    "model.layers.0.attention.wqkv",
-]
+QEP_EXCLUDE_LAYER_KEYWORDS = ["mlp.down_proj"]
+GPTQ_EXCLUDE_LAYER_KEYWORDS: list[str] = []
 REMOTE_CODE = {
     "yue2": ("modeling_yue2.py",),
     "songcomposer": (
@@ -112,17 +102,10 @@ def main() -> None:
         groupsize=GROUP_SIZE,
         actorder=False,
         include_layer_keywords=["model.layers."],
-        exclude_layer_keywords=GPTQ_EXCLUDE_LAYER_KEYWORDS,
     )
-    # SongComposer's PLoRA A/B sublayers contribute only on image-masked
-    # positions. The calibration prompts are text-only; after GPTQ included
-    # these modules, a downstream Hessian became non-finite. Keep this small
-    # image branch in its source dtype, while quantizing the main decoder
-    # linears. First-block wqkv GPTQ produced a non-finite Hessian for the
-    # following attention.wo even with wqkv QEP correction disabled. Keep
-    # that fused projection in source dtype as a narrow stability exception.
-    # Also omit QEP correction for attention.wo, whose adjustment Hessian was
-    # not positive-definite at 20% damping; GPTQ still quantizes attention.wo.
+    # All decoder Linear modules, including SongComposer's fused wqkv and
+    # PLoRA A/B sublayers, use GPTQ. QEP keeps its documented default
+    # down_proj correction exclusion.
     runner = Runner(
         model_config=model_config,
         quantizer=quantizer,
