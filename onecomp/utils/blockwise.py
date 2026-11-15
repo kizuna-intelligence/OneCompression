@@ -248,16 +248,15 @@ def get_blocks_and_inputs(
                 )
 
     # Detect models with heterogeneous layer types (e.g. Gemma4 with
-    # full_attention / sliding_attention).  Adapter-driven flows skip
-    # this entirely (custom architectures handle layer-type dispatch
-    # inside their own forward pass).
-    blocks_parent = None
+    # full_attention / sliding_attention).  This is a structural model
+    # property, so it must also be preserved when an HF-family model uses a
+    # custom adapter (for example, to extract Gemma4's text-only decoder).
+    blocks_parent = _find_blocks_parent(model, blocks)
     has_mixed_types = False
     unique_layer_types = set()
     rotary_hook_handle = None
     pos_emb_map: dict[str, tuple[torch.Tensor, ...]] = {}
-    if adapter is None:
-        blocks_parent = _find_blocks_parent(model, blocks)
+    if blocks_parent is not None:
         layer_types = getattr(
             getattr(blocks_parent, "config", None), "layer_types", None
         )
@@ -318,6 +317,9 @@ def get_blocks_and_inputs(
         except StopForward:
             pass
 
+        if rotary_hook_handle is not None:
+            rotary_hook_handle.remove()
+
         kwargs = dict(blocks[0].kwargs)
         blocks[0].inp = None
 
@@ -335,22 +337,25 @@ def get_blocks_and_inputs(
     # restore the original transformer block
     blocks[0] = blocks[0].module
 
-    # Gemma4 / heterogeneous-layer-type post-processing only applies to
-    # the legacy HF path; adapter-driven flows handle their own dispatch.
-    if adapter is None:
-        pli = _compute_per_layer_inputs(model, blocks, inp_ids, batch_size)
+    # Gemma4's per-layer embeddings and heterogeneous attention metadata are
+    # required regardless of whether model loading used the legacy path or a
+    # custom HF adapter.  Other adapter families are unaffected because the
+    # structural feature checks below simply do not match them.
+    input_ids = model_inputs.get("input_ids")
+    if isinstance(input_ids, torch.Tensor):
+        pli = _compute_per_layer_inputs(model, blocks, input_ids, batch_size)
         if pli is not None:
             kwargs[_PER_LAYER_INPUTS_KEY] = pli
 
-        if len(pos_emb_map) > 1:
-            kwargs[_POS_EMB_MAP_KEY] = pos_emb_map
+    if len(pos_emb_map) > 1:
+        kwargs[_POS_EMB_MAP_KEY] = pos_emb_map
 
-        if has_mixed_types and blocks_parent is not None:
-            attn_mask_map = _compute_per_type_attention_masks(
-                blocks_parent, kwargs, unique_layer_types,
-            )
-            if attn_mask_map is not None:
-                kwargs[_ATTN_MASK_MAP_KEY] = attn_mask_map
+    if has_mixed_types and blocks_parent is not None:
+        attn_mask_map = _compute_per_type_attention_masks(
+            blocks_parent, kwargs, unique_layer_types,
+        )
+        if attn_mask_map is not None:
+            kwargs[_ATTN_MASK_MAP_KEY] = attn_mask_map
 
     return (blocks, inps, kwargs)
 

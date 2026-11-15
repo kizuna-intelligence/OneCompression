@@ -40,9 +40,21 @@ def main() -> int:
     ap.add_argument("--mse", action="store_true")
     ap.add_argument("--asym", action="store_true")
     ap.add_argument("--num-samples", type=int, default=64)
+    ap.add_argument("--qep", action="store_true",
+                    help="enable Quantization Error Propagation (Fujitsu QEP, "
+                         "NeurIPS 2025): propagate each block's quantization "
+                         "error into the next before quantizing it")
+    ap.add_argument("--measure-error", action="store_true",
+                    help="record per-layer output quantization error (for "
+                         "qep on/off comparison)")
     ap.add_argument("--quant-all", action="store_true",
                     help="quantize every Linear (empty exclude set), including "
                          "embedders / modulation / proj_out")
+    ap.add_argument("--include", default=None,
+                    help="comma-separated keywords; if set, only Linears whose "
+                         "name contains one are quantized (e.g. "
+                         "'single_transformer_blocks' to match the QEP block scope "
+                         "for a fair plain-GPTQ-vs-QEP comparison)")
     ap.add_argument("--image-grid", type=int, default=32,
                     help="synthetic latent side length (grid*grid image tokens)")
     ap.add_argument("--text-seq-len", type=int, default=128)
@@ -69,6 +81,11 @@ def main() -> int:
         mse=args.mse,
         sym=not args.asym,
         exclude_layer_keywords=exclude,
+        include_layer_keywords=(
+            [k.strip() for k in args.include.split(",") if k.strip()]
+            if args.include else None
+        ),
+        calc_quant_error=args.measure_error,
     )
 
     calib = CalibrationConfig(
@@ -79,9 +96,23 @@ def main() -> int:
         model_config=model_config,
         quantizer=gptq,
         calibration_config=calib,
-        qep=False,
+        qep=args.qep,
     )
     runner.run()
+
+    if args.measure_error:
+        errs = [
+            r.relative_output_squared_error
+            for r in runner.quantizer.results.values()
+            if getattr(r, "relative_output_squared_error", None) is not None
+        ]
+        if errs:
+            mean_err = sum(errs) / len(errs)
+            print(
+                f"[error] qep={args.qep} layers={len(errs)} "
+                f"mean_relative_output_sq_error={mean_err:.6f}"
+            )
+
     adapter.save_quantized_model(runner, args.save_dir)
     print(f"saved quantized FLUX.2 transformer to {args.save_dir}")
     return 0

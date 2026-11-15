@@ -167,6 +167,14 @@ class AutoBitQuantizer(Quantizer):
     )
     enable_fused_groups: bool = True
 
+    # --- per-layer bit floor (protect fragile layers from ultra-low bits) ---
+    # Any candidate layer whose full name contains one of ``protect_keywords``
+    # is forbidden from being assigned a raw bit-width below ``protect_min_bit``
+    # by the ILP.  Used e.g. to keep a hybrid model's SSM/attention projections
+    # and ``down_proj`` at >=4-bit while the MLP gate/up_proj go to 2-bit.
+    protect_keywords: list = None
+    protect_min_bit: int = 4
+
     # internal variables
     _module_to_quantizer: dict = field(default_factory=dict, repr=False, init=False)
     _name_to_quantizer: dict = field(default_factory=dict, repr=False, init=False)

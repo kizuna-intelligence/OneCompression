@@ -50,6 +50,46 @@ from .base import DiffusionTransformerAdapter
 from .distributions import LogitNormalTimestep, Sampler
 
 
+class _DualStreamPackWrapper(nn.Module):
+    """Collapse Qwen-Image's two evolving residual streams into one tensor.
+
+    A ``QwenImageTransformerBlock`` consumes and returns an image stream
+    (``hidden_states``) and a text stream (``encoder_hidden_states``), which
+    share the inner hidden dim.  OneCompression's block-propagation loop carries
+    a single tensor between blocks, so this wrapper concatenates the two streams
+    along the sequence axis (``packed = cat([image, text], dim=1)``).  On
+    forward it splits them back, calls the real block — which returns
+    ``(encoder_out, hidden_out)`` — and re-packs in the same order.  All other
+    block inputs (``temb``, ``image_rotary_emb``, masks) are batch-independent
+    and pass through ``kwargs`` unchanged.
+
+    The wrapper reuses the real block (and therefore its real ``nn.Linear``
+    submodules) by reference, so the quantizer's pre-built ``module_to_name``
+    map and the saved checkpoint's layer names are unaffected once unwrapped.
+    """
+
+    def __init__(self, block: nn.Module, img_seq: int):
+        super().__init__()
+        self.block = block
+        self.img_seq = int(img_seq)
+
+    @property
+    def _onecomp_wrapped_block(self) -> nn.Module:
+        # A property (not an attribute) so the real block is not registered as
+        # a second submodule.  The QEP driver reads this to unwrap before save.
+        return self.block
+
+    def forward(self, packed: torch.Tensor, **kwargs):
+        hidden_states = packed[:, : self.img_seq]
+        encoder_hidden_states = packed[:, self.img_seq :]
+        encoder_out, hidden_out = self.block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            **kwargs,
+        )
+        return torch.cat([hidden_out, encoder_out], dim=1)
+
+
 class QwenImageDiTAdapter(DiffusionTransformerAdapter):
     """Plug ``QwenImageTransformer2DModel`` into OneCompression."""
 
@@ -92,6 +132,10 @@ class QwenImageDiTAdapter(DiffusionTransformerAdapter):
         self.text_seq_len = int(text_seq_len)
         self.subfolder = subfolder
         self._config: dict[str, Any] | None = None
+        #: Real image-token count from captured calibration, set when real
+        #: inputs are loaded; the dual-stream pack wrapper splits the packed
+        #: tensor here instead of at the synthetic ``image_grid**2``.
+        self._real_img_seq: int | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -133,6 +177,33 @@ class QwenImageDiTAdapter(DiffusionTransformerAdapter):
             )
         return blocks
 
+    # ------------------------------------------------------------------
+    # Dual-stream support: let the QEP block-propagation loop carry both
+    # residual streams.  These opt-in hooks are detected by
+    # ``get_blocks_and_inputs``; single-stream adapters omit them.
+    # ------------------------------------------------------------------
+    def wrap_block(self, block: nn.Module) -> nn.Module:
+        """Wrap a dual-stream block so it reads/writes one packed tensor.
+
+        ``prepare_calibration_inputs`` runs before the blocks are wrapped, so
+        when real calibration was loaded ``self._real_img_seq`` already holds
+        the true image-token count; otherwise fall back to ``image_grid**2``.
+        """
+        img_seq = self._real_img_seq or (self.image_grid * self.image_grid)
+        return _DualStreamPackWrapper(block, img_seq=img_seq)
+
+    def pack_catcher_input(
+        self, args: tuple, kwargs: dict[str, Any]
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Pack the captured block input the same way :class:`_DualStreamPackWrapper`
+        packs its output: ``cat([image_stream, text_stream], dim=1)``.  The
+        remaining kwargs (temb, rotary, masks) are returned for reuse."""
+        kwargs = dict(kwargs)
+        hidden_states = args[0] if args else kwargs.pop("hidden_states")
+        encoder_hidden_states = kwargs.pop("encoder_hidden_states")
+        packed = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+        return packed, kwargs
+
     #: ``img_shapes`` (per-sample RoPE grid) and ``txt_seq_lens`` are Python
     #: lists with one entry per batch item; slice them like batched tensors.
     _BATCH_LIST_KEYS = ("img_shapes", "txt_seq_lens")
@@ -171,6 +242,14 @@ class QwenImageDiTAdapter(DiffusionTransformerAdapter):
         img_seq = grid * grid
         txt_seq = self.text_seq_len
 
+        # Real-activation calibration (preferred for this dual-stream MMDiT).
+        # Synthetic N(0,1) text embeddings are out-of-distribution and make the
+        # 60-block joint attention diverge to NaN; real captured inputs stay
+        # finite.  ``capture_calibration.py`` saves the top-level transformer
+        # forward inputs across denoising steps.
+        if self.calibration_inputs_path:
+            return self._load_real_calibration_inputs(n, cfg, device, log)
+
         gen = torch.Generator(device="cpu").manual_seed(self.seed)
         dtype = self.dtype
 
@@ -204,6 +283,79 @@ class QwenImageDiTAdapter(DiffusionTransformerAdapter):
             "Qwen-Image calibration: %d samples, img_seq=%d (%dx%d), txt_seq=%d, "
             "guidance=%s",
             n, img_seq, grid, grid, txt_seq, bool(cfg.get("guidance_embeds")),
+        )
+        return inputs
+
+    def _load_real_calibration_inputs(
+        self, n: int, cfg: dict[str, Any], device: torch.device, log
+    ) -> dict[str, Any]:
+        """Load captured real top-level DiT inputs and slice to ``n`` samples.
+
+        The saved file (see ``example/firered_int4/capture_calibration.py``)
+        holds batched ``hidden_states`` / ``encoder_hidden_states`` /
+        ``encoder_hidden_states_mask`` / ``timestep`` (+ optional ``guidance``)
+        plus a single-sample ``img_shapes`` / ``txt_seq_lens`` descriptor.  The
+        per-sample list fields are replicated to the chosen batch size.
+        """
+        blob = torch.load(self.calibration_inputs_path, map_location="cpu")
+        avail = int(blob.get("num_calls", blob["hidden_states"].shape[0]))
+        b = min(n, avail)
+        if b < n:
+            log.warning(
+                "Real calibration has only %d samples; using %d (requested %d)",
+                avail, b, n,
+            )
+        dtype = self.dtype
+
+        def _take(key):
+            t = blob[key]
+            return t[:b].to(device=device, dtype=dtype)
+
+        mask = blob.get("encoder_hidden_states_mask")
+        inputs: dict[str, Any] = {
+            "hidden_states": _take("hidden_states"),
+            "encoder_hidden_states": _take("encoder_hidden_states"),
+            # The real pipeline calls the transformer with mask=None (no text
+            # padding to mask); pass it through unchanged so the forward matches.
+            "encoder_hidden_states_mask": (
+                mask[:b].to(device) if isinstance(mask, torch.Tensor) else None
+            ),
+            "timestep": _take("timestep"),
+        }
+        # ``img_shapes`` is the RoPE grid spec.  QwenEmbedRope reads only
+        # ``img_shapes[0]`` (a shared spec for the whole batch — it does *not*
+        # index per batch item), and for QwenImageEditPlus that entry is itself
+        # a *list of grids* (target + reference image), e.g. the captured
+        # ``[[(1,64,64),(1,64,64)]]``.  Replicate the inner grid-*list* to the
+        # batch size so per-chunk slicing in the catcher stays non-empty; it
+        # must stay a list (a tuple breaks the per-grid ``(f,h,w)`` unpack).
+        grids = blob["img_shapes"]
+        if isinstance(grids, list) and len(grids) == 1:
+            grids = grids[0]
+        grids = list(grids)
+        inputs["img_shapes"] = [grids] * b
+        txt0 = blob.get("txt_seq_lens")
+        if isinstance(txt0, list) and txt0:
+            txt0 = txt0[0]
+        # The pipeline passes txt_seq_lens=None (the model derives it from the
+        # encoder mask / shape); preserve that, else replicate the scalar.
+        inputs["txt_seq_lens"] = None if txt0 is None else [int(txt0)] * b
+        if cfg.get("guidance_embeds") and blob.get("guidance") is not None:
+            inputs["guidance"] = blob["guidance"][:b].to(device=device, dtype=dtype)
+        elif cfg.get("guidance_embeds"):
+            inputs["guidance"] = torch.full((b,), 4.0, dtype=dtype, device=device)
+
+        # The dual-stream pack wrapper must split at the *real* image-token
+        # boundary, not the synthetic ``image_grid**2``.  Prefer the value the
+        # capture recorded; fall back to the loaded tensor's seq dim.
+        self._real_img_seq = int(blob.get("img_seq", inputs["hidden_states"].shape[1]))
+
+        log.info(
+            "Qwen-Image REAL calibration: %d samples from %s (img=%s, txt=%s, img_seq=%d)",
+            b, self.calibration_inputs_path,
+            tuple(inputs["hidden_states"].shape),
+            tuple(inputs["encoder_hidden_states"].shape),
+            self._real_img_seq,
         )
         return inputs
 

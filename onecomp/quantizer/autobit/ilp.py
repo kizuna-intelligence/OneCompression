@@ -101,6 +101,33 @@ def assign_by_ilp(quantizer, model, *, use_activation=False):
         if quantizer.enable_fused_groups
         else []
     )
+
+    # Per-layer bit floor: forbid (module, candidate) pairs where the module
+    # name matches a protect keyword and the candidate's raw bit-width is below
+    # protect_min_bit.  Keeps fragile layers (SSM/attn projections, down_proj)
+    # out of the ultra-low-bit candidates while the ILP still optimises the rest.
+    forbidden = set()
+    protect_kw = getattr(quantizer, "protect_keywords", None)
+    if protect_kw:
+        protect_min = getattr(quantizer, "protect_min_bit", 4)
+        n_protected = 0
+        for m, (name, _module) in enumerate(candidates):
+            if any(kw in name for kw in protect_kw):
+                hit = False
+                for b, rb in enumerate(raw_bits):
+                    if rb is not None and rb < protect_min:
+                        forbidden.add((m, b))
+                        hit = True
+                if hit:
+                    n_protected += 1
+        logger.info(
+            "ILP: protecting %d/%d modules to >=%d-bit (keywords=%s)",
+            n_protected,
+            n_modules,
+            protect_min,
+            protect_kw,
+        )
+
     chosen = _solve_ilp(
         errors,
         params_per_module,
@@ -108,6 +135,7 @@ def assign_by_ilp(quantizer, model, *, use_activation=False):
         quantizer.target_bit,
         logger,
         fused_groups=fused_groups,
+        forbidden=forbidden,
     )
 
     # 4. build assignments
@@ -233,7 +261,14 @@ def _rtn_errors(weight, quantizers, logger, *, a_diag=None, b_diag=None):
 
     Otherwise returns the plain Frobenius norm squared ``||W - Ŵ||²_F``.
     """
-    w = weight.float()
+    # Error evaluation is a dense fp32 quantize + Gram-weighted matmul over
+    # every candidate. With the model resident on CPU (block-streamed quant),
+    # doing this on CPU for a 27B model is pathologically slow (single op can
+    # pin all cores for minutes). Run it on the GPU one weight at a time when
+    # CUDA is available -- one weight matrix is tiny next to a 24GB card, so
+    # this is a strict speedup at negligible extra VRAM.
+    _ev_device = torch.device("cuda") if torch.cuda.is_available() else weight.device
+    w = weight.float().to(_ev_device)
     if w.ndim > 2:
         w = w.flatten(1)
 
@@ -261,7 +296,9 @@ def _rtn_errors(weight, quantizers, logger, *, a_diag=None, b_diag=None):
     return errors
 
 
-def _solve_ilp(errors, params_per_module, eff_matrix, target_bit, logger, *, fused_groups=None):
+def _solve_ilp(
+    errors, params_per_module, eff_matrix, target_bit, logger, *, fused_groups=None, forbidden=None
+):
     """Solve the assignment ILP via OR-Tools SCIP solver.
 
     Args:
@@ -307,6 +344,11 @@ def _solve_ilp(errors, params_per_module, eff_matrix, target_bit, logger, *, fus
 
     for m in range(n_modules):
         solver.Add(sum(x[m][b] for b in range(n_bits)) == 1)
+
+    if forbidden:
+        for (m, b) in forbidden:
+            solver.Add(x[m][b] == 0)
+        logger.info("ILP: added %d forbidden (module, bit) constraints", len(forbidden))
 
     if fused_groups:
         n_tied = 0

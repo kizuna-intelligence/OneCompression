@@ -44,6 +44,11 @@ def main() -> int:
                     help="symmetric quantization (default asymmetric)")
     ap.add_argument("--mse", action="store_true",
                     help="MSE grid search for clipping (slower, better)")
+    ap.add_argument("--quant-modulation", action="store_true",
+                    help="also quantize the AdaLN img_mod/txt_mod projections. "
+                         "For Qwen-Image these dominate the weight budget "
+                         "(~13.6GB fp16 of the 20B), so quantizing them is "
+                         "required to get a low-VRAM (~11GB resident) DiT.")
     ap.add_argument("--dtype", default="bfloat16")
     args = ap.parse_args()
 
@@ -58,13 +63,17 @@ def main() -> int:
     )
     model_config = ModelConfig(adapter=adapter)
 
+    exclude = (
+        [] if args.quant_modulation
+        else QwenImageDiTAdapter.default_exclude_layer_keywords()
+    )
     rtn = RTN(
         wbits=4,
         groupsize=args.groupsize,
         sym=args.sym,
         mse=args.mse,
         include_layer_keywords=["transformer_blocks"],
-        exclude_layer_keywords=QwenImageDiTAdapter.default_exclude_layer_keywords(),
+        exclude_layer_keywords=exclude,
     )
 
     runner = Runner(
@@ -73,6 +82,24 @@ def main() -> int:
         qep=False,
     )
     runner.run()
+
+    # ``save_quantized_model`` loads a fresh bf16 model (~41GB) to repack, so we
+    # must shrink everything else first to keep the host under earlyoom's limit
+    # (it SIGTERMs at 3% free RAM).  Two pins to drop before the reload:
+    #   1) ``module_to_name`` keys are the *original* bf16 Linear modules, which
+    #      keep the entire pre-quant model (~41GB) alive.
+    #   2) each result's ``dequantized_weight`` is a full bf16 weight copy
+    #      (~41GB total) that the packed save never reads.
+    # Only the (now uint8) ``quantized_weight`` + fp16 scale/zero are needed for
+    # packing, so this leaves ~20GB of results + the 41GB reload at peak.
+    import gc
+
+    runner.quantizer.module_to_name = {}
+    for _result in runner.quantizer.results.values():
+        if getattr(_result, "dequantized_weight", None) is not None:
+            _result.dequantized_weight = None
+    gc.collect()
+
     adapter.save_quantized_model(runner, args.save_dir)
     print(f"saved RTN-int4 FireRed/Qwen-Image DiT to {args.save_dir}")
     return 0

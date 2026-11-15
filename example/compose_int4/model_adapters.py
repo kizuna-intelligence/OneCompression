@@ -1,0 +1,111 @@
+"""HF adapters for the local YuE2 and SongComposer int4 experiment."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import torch
+from torch import nn
+
+from onecomp.adapters.hf_llm import HFLLMAdapter
+
+
+class ComposeModelAdapter(HFLLMAdapter):
+    """Load a remote-code causal LM and expose its decoder blocks to OneComp."""
+
+    def __init__(self, model_kind: str, model_path: str, *, dtype: str, device: str):
+        if model_kind not in {"yue2", "songcomposer"}:
+            raise ValueError(f"unsupported model_kind: {model_kind}")
+        self.model_kind = model_kind
+        super().__init__(path=model_path, dtype=dtype, device=device)
+
+    def load_config(self):
+        from transformers import AutoConfig
+
+        return AutoConfig.from_pretrained(
+            self.get_model_id_or_path(), trust_remote_code=True, local_files_only=True
+        )
+
+    def load_model(self, device_map: str | None = None) -> nn.Module:
+        from transformers import AutoModelForCausalLM
+
+        selected_map = self.device if device_map is None else device_map
+        dtype = getattr(torch, self.dtype)
+        model = AutoModelForCausalLM.from_pretrained(
+            self.get_model_id_or_path(),
+            trust_remote_code=True,
+            local_files_only=True,
+            dtype=dtype,
+            device_map=selected_map,
+        )
+        model.eval()
+        return model
+
+    def load_tokenizer(self):
+        if self.model_kind == "yue2":
+            from yue2.tokenization_yue2 import YuE2TextTokenizer
+
+            return YuE2TextTokenizer(Path(self.get_model_id_or_path()) / "qwen.tiktoken")
+
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            self.get_model_id_or_path(), trust_remote_code=True, local_files_only=True
+        )
+
+    def get_blocks(self, model: nn.Module) -> nn.ModuleList:
+        core = getattr(model, "model", None)
+        blocks = getattr(core, "layers", None)
+        if not isinstance(blocks, nn.ModuleList) or not len(blocks):
+            raise RuntimeError(f"{type(model).__name__} has no model.layers ModuleList")
+        return blocks
+
+    def get_head_modules(
+        self, model: nn.Module
+    ) -> tuple[nn.Module | None, nn.Module | None]:
+        core = getattr(model, "model", None)
+        norm = getattr(core, "norm", None)
+        head = None
+        getter = getattr(model, "get_output_embeddings", None)
+        if callable(getter):
+            head = getter()
+        if head is None:
+            head = getattr(model, "lm_head", None) or getattr(model, "output", None)
+        return norm, head
+
+    def prepare_calibration_inputs(
+        self,
+        model: nn.Module,
+        calibration_config,
+        device: torch.device,
+        logger=None,
+    ) -> dict[str, Any]:
+        if self.model_kind != "yue2":
+            return super().prepare_calibration_inputs(
+                model, calibration_config, device, logger
+            )
+
+        path = Path(calibration_config.calibration_dataset)
+        rows = [
+            json.loads(line)["input_ids"]
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        count = int(calibration_config.num_calibration_samples)
+        if len(rows) < count:
+            raise ValueError(f"need {count} YuE2 plan sequences, found {len(rows)}")
+        length = int(calibration_config.max_length)
+        pad_id = int(getattr(model.config, "eos_token_id", 0) or 0)
+        input_ids = torch.full((count, length), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((count, length), dtype=torch.long)
+        for index, row in enumerate(rows[:count]):
+            tokens = [int(token) for token in row[:length]]
+            if not tokens:
+                raise ValueError(f"empty YuE2 plan sequence at row {index}")
+            input_ids[index, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+            attention_mask[index, : len(tokens)] = 1
+        return {
+            "input_ids": input_ids.to(device),
+            "attention_mask": attention_mask.to(device),
+        }

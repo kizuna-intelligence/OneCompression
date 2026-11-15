@@ -224,7 +224,11 @@ class HFLLMAdapter(ModelAdapter):
         logits = head(normed)
         ids = sample_inputs["input_ids"]
         shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = ids[:, 1:].contiguous()
+        # Labels must live on the logits' device.  When the model is loaded on
+        # CPU and quantized block-by-block on the GPU (streaming path for models
+        # too large for VRAM), the curvature head runs on cuda while
+        # ``input_ids`` stay on CPU — align them here to avoid a device mismatch.
+        shift_labels = ids[:, 1:].contiguous().to(shift_logits.device)
         return F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),

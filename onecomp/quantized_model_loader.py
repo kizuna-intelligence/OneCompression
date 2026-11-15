@@ -94,6 +94,15 @@ class QuantizedModelLoader:
         # Load all weights (quantized + non-quantized) in one go
         model.load_state_dict(state_dict, strict=False, assign=True)
 
+        # ``assign=True`` replaces Parameter objects and can therefore break
+        # weight sharing established during model construction.  Causal LMs
+        # commonly omit ``lm_head.weight`` from a checkpoint because it is tied
+        # to ``embed_tokens.weight``; without re-tying here the output head keeps
+        # its random initialization and generation becomes meaningless.
+        tie_weights = getattr(model, "tie_weights", None)
+        if callable(tie_weights):
+            tie_weights()
+
         # Register Hadamard hooks for rotation-preprocessed models
         if quant_config.get("rotated", False):
             from .pre_process.rotation_utils import register_online_hadamard_hooks
