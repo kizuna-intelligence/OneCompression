@@ -81,22 +81,50 @@ class ComposeModelAdapter(HFLLMAdapter):
         device: torch.device,
         logger=None,
     ) -> dict[str, Any]:
-        if self.model_kind != "yue2":
-            return super().prepare_calibration_inputs(
-                model, calibration_config, device, logger
-            )
-
         path = Path(calibration_config.calibration_dataset)
-        rows = [
-            json.loads(line)["input_ids"]
+        records = [
+            json.loads(line)
             for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
         count = int(calibration_config.num_calibration_samples)
-        if len(rows) < count:
-            raise ValueError(f"need {count} YuE2 plan sequences, found {len(rows)}")
+        if len(records) < count:
+            raise ValueError(
+                f"need {count} {self.model_kind} calibration records, found {len(records)}"
+            )
         length = int(calibration_config.max_length)
-        pad_id = int(getattr(model.config, "eos_token_id", 0) or 0)
+        if self.model_kind == "yue2":
+            rows = [record["input_ids"] for record in records[:count]]
+            pad_id = int(getattr(model.config, "eos_token_id", 0) or 0)
+        else:
+            tokenizer = self.load_tokenizer()
+            rows = []
+            for index, record in enumerate(records[:count]):
+                text = record.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError(f"empty Canto calibration prompt at row {index}")
+                token_ids = tokenizer(text, add_special_tokens=True)["input_ids"]
+                if token_ids and isinstance(token_ids[0], list):
+                    token_ids = token_ids[0]
+                if len(token_ids) > length:
+                    raise ValueError(
+                        f"Canto calibration prompt {index} has {len(token_ids)} tokens, "
+                        f"exceeding configured max_length={length}"
+                    )
+                rows.append(token_ids)
+            pad_id = next(
+                (
+                    value
+                    for value in (
+                        getattr(tokenizer, "pad_token_id", None),
+                        getattr(tokenizer, "eos_token_id", None),
+                        getattr(tokenizer, "bos_token_id", None),
+                        0,
+                    )
+                    if value is not None
+                ),
+                0,
+            )
         input_ids = torch.full((count, length), pad_id, dtype=torch.long)
         attention_mask = torch.zeros((count, length), dtype=torch.long)
         for index, row in enumerate(rows[:count]):

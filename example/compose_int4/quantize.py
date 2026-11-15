@@ -78,7 +78,9 @@ def main() -> None:
         raise FileExistsError(f"refusing to overwrite nonempty output: {output_path}")
 
     dtype = "bfloat16" if args.kind == "yue2" else "float16"
-    max_length = args.max_length or (512 if args.kind == "yue2" else 48)
+    # Each production SongComposer calibration prompt is a complete sequence
+    # (64–73 tokens in this set); the adapter right-pads those 32 rows to 80.
+    max_length = args.max_length or (512 if args.kind == "yue2" else 80)
     adapter = ComposeModelAdapter(
         args.kind, str(model_path), dtype=dtype, device=args.device
     )
