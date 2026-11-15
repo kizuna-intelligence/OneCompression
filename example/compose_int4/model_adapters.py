@@ -112,18 +112,26 @@ class ComposeModelAdapter(HFLLMAdapter):
             rows = [record["input_ids"] for record in records[:count]]
             pad_id = int(getattr(model.config, "eos_token_id", 0) or 0)
         else:
-            tokenizer = self.load_tokenizer()
+            tokenizer = None
             rows = []
             for index, record in enumerate(records[:count]):
-                text = record.get("text")
-                if not isinstance(text, str) or not text.strip():
-                    raise ValueError(f"empty Canto calibration prompt at row {index}")
-                # Match modeling_internlm2.py::inference, which wraps the
-                # prompt in the same user turn before tokenization.
-                wrapped = f"[UNUSED_TOKEN_146]user\n{text}[UNUSED_TOKEN_145]\n"
-                token_ids = tokenizer(wrapped, add_special_tokens=True)["input_ids"]
-                if token_ids and isinstance(token_ids[0], list):
-                    token_ids = token_ids[0]
+                token_ids = record.get("input_ids")
+                if token_ids is None:
+                    text = record.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        raise ValueError(f"empty Canto calibration prompt at row {index}")
+                    # Match modeling_internlm2.py::inference, which wraps the
+                    # prompt in the same user turn before tokenization.
+                    wrapped = f"[UNUSED_TOKEN_146]user\n{text}[UNUSED_TOKEN_145]\n"
+                    if tokenizer is None:
+                        tokenizer = self.load_tokenizer()
+                    token_ids = tokenizer(wrapped, add_special_tokens=True)["input_ids"]
+                    if token_ids and isinstance(token_ids[0], list):
+                        token_ids = token_ids[0]
+                if not isinstance(token_ids, (list, tuple)) or any(
+                    not isinstance(token, int) for token in token_ids
+                ):
+                    raise ValueError(f"invalid Canto calibration token IDs at row {index}")
                 if len(token_ids) > length:
                     raise ValueError(
                         f"Canto calibration prompt {index} has {len(token_ids)} tokens, "
