@@ -289,9 +289,14 @@ def run_quantize_with_qep_arch(
     # TODO: Parameterize when necessary
     batch_size = 16
 
-    model = model_config.load_model(device_map="cpu")
-    device = qep_config.device
     adapter = getattr(model_config, "adapter", None)
+    # Most models are analyzed from CPU weights and transfer one block at a
+    # time. A model adapter may opt in to a device-resident calibration copy
+    # when its custom forward path produces different numerical behavior
+    # after CPU loading and per-block migration.
+    model_device_map = getattr(adapter, "qep_model_device_map", "cpu")
+    model = model_config.load_model(device_map=model_device_map)
+    device = qep_config.device
 
     model_inputs = adapter.prepare_calibration_inputs(
         model=model,

@@ -18,6 +18,11 @@ class ComposeModelAdapter(HFLLMAdapter):
         if model_kind not in {"yue2", "songcomposer"}:
             raise ValueError(f"unsupported model_kind: {model_kind}")
         self.model_kind = model_kind
+        # SongComposer's custom eager attention produced non-finite attention
+        # activations when OneComp loaded fp16 weights on CPU then migrated a
+        # block to GPU. The 7B fp16 model fits on the approved L40S, so keep
+        # this calibration copy resident on the target device.
+        self.qep_model_device_map = device if model_kind == "songcomposer" else "cpu"
         super().__init__(path=model_path, dtype=dtype, device=device)
 
     def load_config(self):
@@ -162,7 +167,9 @@ class ComposeModelAdapter(HFLLMAdapter):
                 raise ValueError(f"empty YuE2 plan sequence at row {index}")
             input_ids[index, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
             attention_mask[index, : len(tokens)] = 1
+        model_device = next(model.parameters()).device
+        target_device = model_device if model_device.type != "cpu" else device
         return {
-            "input_ids": input_ids.to(device),
-            "attention_mask": attention_mask.to(device),
+            "input_ids": input_ids.to(target_device),
+            "attention_mask": attention_mask.to(target_device),
         }
