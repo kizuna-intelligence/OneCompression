@@ -31,7 +31,11 @@ QEP_EXCLUDE_LAYER_KEYWORDS = [
     "Plora_B",
     "model.layers.0.attention.wo",
 ]
-GPTQ_EXCLUDE_LAYER_KEYWORDS = ["Plora_A", "Plora_B"]
+GPTQ_EXCLUDE_LAYER_KEYWORDS = [
+    "Plora_A",
+    "Plora_B",
+    "model.layers.0.attention.wqkv",
+]
 REMOTE_CODE = {
     "yue2": ("modeling_yue2.py",),
     "songcomposer": (
@@ -112,11 +116,12 @@ def main() -> None:
     # SongComposer PLoRA A/B are image-masked and unused by text-only
     # generation. GPTQ on those modules left the following Hessian non-finite
     # even after using the checkpoint's pad_token_id, so keep that small
-    # branch in source dtype. The fused base wqkv and other decoder linears
-    # remain GPTQ int4. QEP also omits correction for PLoRA and the documented
-    # down_proj default. The first block's attention.wo adjustment Hessian is
-    # not positive-definite at 20% damping, so omit only that correction while
-    # GPTQ still quantizes the projection.
+    # branch in source dtype. GPTQ on first-block fused wqkv left the following
+    # attention.wo Hessian non-finite, so retain that projection in source
+    # dtype too; remaining decoder linears stay GPTQ int4. QEP also omits
+    # correction for PLoRA and the documented down_proj default. The first
+    # block's attention.wo adjustment Hessian is not positive-definite at 20%
+    # damping, so omit only that correction while GPTQ quantizes it.
     runner = Runner(
         model_config=model_config,
         quantizer=quantizer,
