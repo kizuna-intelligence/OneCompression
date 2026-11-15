@@ -32,7 +32,11 @@ QEP_EXCLUDE_LAYER_KEYWORDS = [
     "model.layers.0.attention.wqkv",
     "model.layers.0.attention.wo",
 ]
-GPTQ_EXCLUDE_LAYER_KEYWORDS = ["Plora_A", "Plora_B"]
+GPTQ_EXCLUDE_LAYER_KEYWORDS = [
+    "Plora_A",
+    "Plora_B",
+    "model.layers.0.attention.wqkv",
+]
 REMOTE_CODE = {
     "yue2": ("modeling_yue2.py",),
     "songcomposer": (
@@ -114,11 +118,11 @@ def main() -> None:
     # positions. The calibration prompts are text-only; after GPTQ included
     # these modules, a downstream Hessian became non-finite. Keep this small
     # image branch in its source dtype, while quantizing the main decoder
-    # linears. The first block's attention.wo hit a non-positive-definite QEP
-    # adjustment Hessian at 20% damping. With GPTQ quantizing first-block
-    # wqkv, the following attention.wo Hessian was non-finite, so omit QEP
-    # correction for wqkv as a controlled diagnostic while GPTQ still
-    # quantizes both projections.
+    # linears. First-block wqkv GPTQ produced a non-finite Hessian for the
+    # following attention.wo even with wqkv QEP correction disabled. Keep
+    # that fused projection in source dtype as a narrow stability exception.
+    # Also omit QEP correction for attention.wo, whose adjustment Hessian was
+    # not positive-definite at 20% damping; GPTQ still quantizes attention.wo.
     runner = Runner(
         model_config=model_config,
         quantizer=quantizer,
