@@ -25,7 +25,12 @@ from compose_int4.model_adapters import ComposeModelAdapter  # noqa: E402
 
 GROUP_SIZE = 32
 WBITS = 4
-QEP_EXCLUDE_LAYER_KEYWORDS = ["mlp.down_proj", "Plora_A", "Plora_B"]
+QEP_EXCLUDE_LAYER_KEYWORDS = [
+    "mlp.down_proj",
+    "Plora_A",
+    "Plora_B",
+    "model.layers.0.attention.wo",
+]
 GPTQ_EXCLUDE_LAYER_KEYWORDS = ["Plora_A", "Plora_B"]
 REMOTE_CODE = {
     "yue2": ("modeling_yue2.py",),
@@ -105,10 +110,12 @@ def main() -> None:
         exclude_layer_keywords=GPTQ_EXCLUDE_LAYER_KEYWORDS,
     )
     # SongComposer's PLoRA A/B sublayers contribute only on image-masked
-    # positions. The calibration prompts are text-only; after GPTQ quantized
+    # positions. The calibration prompts are text-only; after GPTQ included
     # these modules, a downstream Hessian became non-finite. Keep this small
     # image branch in its source dtype, while quantizing the main decoder
-    # linears.
+    # linears. The first block's attention.wo hit a non-positive-definite QEP
+    # adjustment Hessian at 20% damping; omit only that correction while GPTQ
+    # still quantizes the projection with its inverse-Hessian procedure.
     runner = Runner(
         model_config=model_config,
         quantizer=quantizer,
