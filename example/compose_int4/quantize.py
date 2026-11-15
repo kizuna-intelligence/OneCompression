@@ -29,6 +29,7 @@ QEP_EXCLUDE_LAYER_KEYWORDS = [
     "mlp.down_proj",
     "Plora_A",
     "Plora_B",
+    "model.layers.0.attention.wqkv",
     "model.layers.0.attention.wo",
 ]
 GPTQ_EXCLUDE_LAYER_KEYWORDS = ["Plora_A", "Plora_B"]
@@ -114,8 +115,10 @@ def main() -> None:
     # these modules, a downstream Hessian became non-finite. Keep this small
     # image branch in its source dtype, while quantizing the main decoder
     # linears. The first block's attention.wo hit a non-positive-definite QEP
-    # adjustment Hessian at 20% damping; omit only that correction while GPTQ
-    # still quantizes the projection with its inverse-Hessian procedure.
+    # adjustment Hessian at 20% damping. With GPTQ quantizing first-block
+    # wqkv, the following attention.wo Hessian was non-finite, so omit QEP
+    # correction for wqkv as a controlled diagnostic while GPTQ still
+    # quantizes both projections.
     runner = Runner(
         model_config=model_config,
         quantizer=quantizer,
