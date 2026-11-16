@@ -31,12 +31,14 @@ QEP_EXCLUDE_LAYER_KEYWORDS = [
     "Plora_B",
     "model.layers.0.attention.wo",
     "model.layers.6.feed_forward.w2",
+    "model.layers.25.feed_forward.w2",
 ]
 GPTQ_EXCLUDE_LAYER_KEYWORDS = [
     "Plora_A",
     "Plora_B",
     "model.layers.0.attention.wqkv",
     "model.layers.6.feed_forward.w2",
+    "model.layers.25.feed_forward.w2",
 ]
 REMOTE_CODE = {
     "yue2": ("modeling_yue2.py",),
@@ -121,11 +123,13 @@ def main() -> None:
     # branch in source dtype. GPTQ on first-block fused wqkv left the following
     # attention.wo Hessian non-finite, so retain that projection in source
     # dtype too. GPTQ's layer-6 feed_forward.w2 Hessian also failed Cholesky
-    # after its damping retries, so leave that projection in source dtype.
+    # after its damping retries. The same happened at layer 25, so leave both
+    # projections in source dtype.
     # Remaining decoder linears stay GPTQ int4. QEP omits correction for
     # PLoRA, the documented down_proj default, the first block's attention.wo
     # (whose adjustment Hessian was not positive-definite at 20% damping), and
-    # the layer-6 feed_forward.w2 retained in source dtype.
+    # the layer-6 and layer-25 feed_forward.w2 projections retained in source
+    # dtype.
     runner = Runner(
         model_config=model_config,
         quantizer=quantizer,
