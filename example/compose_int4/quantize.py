@@ -71,6 +71,43 @@ def _copy_remote_code(kind: str, model_path: Path, output_path: Path) -> None:
             shutil.copy2(source, output_path / name)
 
 
+def _save_quantized_model(
+    runner: Runner, kind: str, model_path: Path, output_path: Path
+) -> None:
+    if kind != "songcomposer":
+        runner.save_quantized_model(str(output_path), pack_weights=True)
+        return
+
+    # Transformers 5 rejects the checkpoint's legacy config.max_length during
+    # save_pretrained(). The SongComposer remote model code still reads this
+    # value while constructing the model, so temporarily remove it for the
+    # save and restore the original field in the serialized config afterward.
+    source_config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+    max_length = source_config.get("max_length")
+    if not isinstance(max_length, int) or max_length <= 0:
+        raise ValueError("SongComposer source config must provide a positive max_length")
+    model, tokenizer = runner.create_quantized_model(
+        pack_weights=True, use_gemlite=False
+    )
+    if not hasattr(model.config, "max_length"):
+        raise ValueError("SongComposer model config lost max_length before save")
+    delattr(model.config, "max_length")
+    output_path.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(output_path))
+    tokenizer.save_pretrained(str(output_path))
+    config_path = output_path / "config.json"
+    saved_config = json.loads(config_path.read_text(encoding="utf-8"))
+    saved_config["max_length"] = max_length
+    config_path.write_text(
+        json.dumps(saved_config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    for filename in ("processor_config.json", "preprocessor_config.json"):
+        source = model_path / filename
+        if source.is_file():
+            shutil.copy2(source, output_path / filename)
+
+
 def _bits_summary(config: dict) -> dict[str, int]:
     entries = config.get("quantization_config", {}).get("quantization_bits", [])
     counts: Counter[str] = Counter()
@@ -152,7 +189,7 @@ def main() -> None:
     quantization_seconds = time.perf_counter() - started
     output_path.mkdir(parents=True, exist_ok=True)
     save_started = time.perf_counter()
-    runner.save_quantized_model(str(output_path), pack_weights=True)
+    _save_quantized_model(runner, args.kind, model_path, output_path)
     _copy_remote_code(args.kind, model_path, output_path)
     save_seconds = time.perf_counter() - save_started
 
