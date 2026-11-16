@@ -11,6 +11,32 @@ from torch import nn
 from onecomp.adapters.hf_llm import HFLLMAdapter
 
 
+class _YuE2DecoderBlockKwargsWrapper(nn.Module):
+    """Preserve YuE2's positional RoPE inputs in OneComp's block loop."""
+
+    _ARG_NAMES = ("cos", "sin", "past_key_value")
+
+    def __init__(self, block: nn.Module, block_index: int):
+        super().__init__()
+        self.block = block
+        self._onecomp_block_idx = int(block_index)
+
+    @property
+    def _onecomp_wrapped_block(self) -> nn.Module:
+        return self.block
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        if args:
+            kwargs = dict(kwargs)
+            for name, value in zip(self._ARG_NAMES, args):
+                kwargs.setdefault(name, value)
+        # OneComp replays each decoder block directly. The original backbone
+        # supplies the per-layer index; this wrapper keeps that value correct
+        # during the block-wise replay too.
+        kwargs["layer_idx"] = self._onecomp_block_idx
+        return self.block(hidden_states, **kwargs)
+
+
 class ComposeModelAdapter(HFLLMAdapter):
     """Load a remote-code causal LM and expose its decoder blocks to OneComp."""
 
@@ -18,6 +44,7 @@ class ComposeModelAdapter(HFLLMAdapter):
         if model_kind not in {"yue2", "songcomposer"}:
             raise ValueError(f"unsupported model_kind: {model_kind}")
         self.model_kind = model_kind
+        self._wrap_block_counter = 0
         # SongComposer's custom eager attention produced non-finite attention
         # activations when OneComp loaded fp16 weights on CPU then migrated a
         # block to GPU. The 7B fp16 model fits on the approved L40S, so keep
@@ -79,7 +106,26 @@ class ComposeModelAdapter(HFLLMAdapter):
         blocks = getattr(core, "layers", None)
         if not isinstance(blocks, nn.ModuleList) or not len(blocks):
             raise RuntimeError(f"{type(model).__name__} has no model.layers ModuleList")
+        self._wrap_block_counter = 0
         return blocks
+
+    def wrap_block(self, block: nn.Module) -> nn.Module:
+        if self.model_kind != "yue2":
+            return block
+        index = self._wrap_block_counter
+        self._wrap_block_counter += 1
+        return _YuE2DecoderBlockKwargsWrapper(block, index)
+
+    def pack_catcher_input(
+        self, args: tuple, kwargs: dict[str, Any]
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if not args:
+            raise RuntimeError("decoder block catcher expected positional hidden states")
+        packed_kwargs = dict(kwargs)
+        if self.model_kind == "yue2":
+            for name, value in zip(_YuE2DecoderBlockKwargsWrapper._ARG_NAMES, args[1:]):
+                packed_kwargs.setdefault(name, value)
+        return args[0], packed_kwargs
 
     def get_head_modules(
         self, model: nn.Module
