@@ -79,9 +79,10 @@ def _save_quantized_model(
         return
 
     # Transformers 5 rejects the checkpoint's legacy config.max_length during
-    # save_pretrained(). The SongComposer remote model code still reads this
-    # value while constructing the model, so temporarily remove it for the
-    # save and restore the original field in the serialized config afterward.
+    # save_pretrained(). It also expects _tied_weights_keys to be a mapping,
+    # while this remote model declares the older list form. Adapt both fields
+    # only while serializing; the remote model code still needs the original
+    # max_length and list form at runtime.
     source_config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
     max_length = source_config.get("max_length")
     if not isinstance(max_length, int) or max_length <= 0:
@@ -91,9 +92,21 @@ def _save_quantized_model(
     )
     if not hasattr(model.config, "max_length"):
         raise ValueError("SongComposer model config lost max_length before save")
-    delattr(model.config, "max_length")
-    output_path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(output_path))
+    model_config_max_length = model.config.max_length
+    original_tied_weights_keys = []
+    try:
+        delattr(model.config, "max_length")
+        for module in model.modules():
+            tied_keys = getattr(module, "_tied_weights_keys", None)
+            if isinstance(tied_keys, list):
+                original_tied_weights_keys.append((module, tied_keys))
+                module._tied_weights_keys = dict.fromkeys(tied_keys)
+        output_path.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(str(output_path))
+    finally:
+        model.config.max_length = model_config_max_length
+        for module, tied_keys in original_tied_weights_keys:
+            module._tied_weights_keys = tied_keys
     tokenizer.save_pretrained(str(output_path))
     config_path = output_path / "config.json"
     saved_config = json.loads(config_path.read_text(encoding="utf-8"))
